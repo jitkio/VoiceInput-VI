@@ -1,8 +1,16 @@
-# ---- 大文件：模型不入库（用 python download_models.py 下载） ----
+# ---- 大文件：模型 / llama.cpp / 打包产物 都不入库 ----
 models/
+llama/
 llama.cpp/
 *.gguf
 *.part
+_download/
+
+# 打包
+dist/
+build/
+*.spec
+app.ico
 
 # ---- 运行时产物 ----
 *.log
@@ -22,6 +30,7 @@ config.local.toml
 *.m4a
 *.png
 *.jpg
+*.ico
 !docs/*.png
 
 # ---- 系统垃圾 ----

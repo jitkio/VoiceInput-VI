@@ -14,7 +14,7 @@ max_seconds = 150  # 单次录音上限（秒）。实测模型硬上限约 4.2 
 manage = true
 # llama.cpp 解压目录（相对项目根目录，也可写绝对路径）
 # 到 https://github.com/ggml-org/llama.cpp/releases 下载 Windows x64 (CUDA 12) 版
-dir = "llama.cpp"
+dir = "llama"
 asr_model = "models/Qwen3-ASR-1.7B-Q8_0.gguf"        # 识别模型（LLM 部分）
 asr_mmproj = "models/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"  # 识别模型（音频编码器）
 polish_model = "models/Qwen3.5-4B-Q4_K_M.gguf"       # 润色模型

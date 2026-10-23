@@ -1,13 +1,73 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-本地语音输入 —— 按住热键说话，松开自动上屏。
+"""本地离线语音输入 —— 单文件版（Qwen3-ASR + Qwen3.5 润色，llama.cpp 本地推理）。
 
-链路：  麦克风 -> 掐静音 -> Qwen3-ASR-1.7B (llama.cpp) -> Qwen3.5-4B 润色 -> 粘贴到光标
+按住热键说话，松开自动识别 + 润色 + 粘贴到光标处。声音不出本机。
 
-启动前先跑 start_asr.bat / start_polish.bat。
+    python voice_input.py                 启动（模型服务由本程序托管）
+    python voice_input.py --setup         一次性准备：依赖 + llama.cpp + 模型
+    python voice_input.py --test a.wav    不用麦克风，测整条链路
+    python voice_input.py --make-icon i.ico
+
+配置见同目录 config.toml；模型放 models/，llama.cpp 放 llama/。
 """
 from __future__ import annotations
+
+import argparse
+import base64
+import ctypes
+import io
+import json
+import math
+import os
+import queue
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
+import wave
+import zipfile
+from collections import deque
+from ctypes import wintypes as wt
+from pathlib import Path
+
+import numpy as np
+import pyperclip
+import sounddevice as sd
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from pynput import keyboard as kb
+
+try:
+    import skia
+except Exception:          # 没装就降级到 Pillow 渲染
+    skia = None
+
+try:
+    import pystray
+except Exception:          # 没装就没有托盘菜单
+    pystray = None
+
+
+def app_dir() -> Path:
+    """脚本目录；PyInstaller 打包后是 exe 所在目录（配置/模型/日志都放那里）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+ROOT = app_dir()
+CFG_PATH = ROOT / "config.toml"
+
+
+# ==============================================================================
+#  1. 配置 / 录音 / HTTP / ASR / 润色 / 上屏
+# ==============================================================================
+
 
 import base64
 import io
@@ -31,11 +91,7 @@ import pyperclip
 import sounddevice as sd
 from pynput import keyboard as kb
 
-from overlay_win import LevelMeter, create_overlay
-from tray_icon import Tray
 
-ROOT = Path(__file__).resolve().parent
-CFG_PATH = ROOT / "config.toml"
 
 # pythonw（开机自启）没有控制台，stdout 是 None，print 会炸 → 写日志文件
 if sys.stdout is None:
@@ -391,7 +447,7 @@ class App:
             try:
                 raw = transcribe(to_wav(audio, self.sr), self.cfg)
             except urllib.error.URLError as e:
-                msg = "识别服务没连上（先运行 start_all.bat）"
+                msg = "识别服务没连上（先运行 VoiceInput.bat）"
                 print(f"[error] {msg}: {e.reason}")
                 self._show("error", msg)
                 return
@@ -790,6 +846,7 @@ def install_exit_hooks(on_exit):
 
 def acquire_single_instance(port: int = 49731):
     """用绑定本地端口当锁，防止双击两次开了两个实例抢 CapsLock。"""
+    port = int(os.environ.get("VOICE_INPUT_LOCK_PORT") or port)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", port))
@@ -805,7 +862,7 @@ def main():
     lock = acquire_single_instance()
     if lock is None:
         print("已经有一个语音输入在运行了，这个窗口会在 2 秒后自动关闭。")
-        print("（要彻底退出，用托盘右键 → 退出，或双击 stop_all.bat）")
+        print("（要彻底退出：托盘右键 → 退出，或运行 VoiceInput.bat stop）")
         time.sleep(2.0)
         return
 
@@ -829,5 +886,2095 @@ def main():
         os._exit(0)
 
 
+# ==============================================================================
+#  2. 悬浮胶囊（Win32 + Pillow / Tk 兜底）
+# ==============================================================================
+
+import ctypes
+import math
+import queue
+import sys
+import threading
+import time
+from collections import deque
+from ctypes import wintypes as wt
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 音量表
+
+
+class LevelMeter:
+    """麦克风电平 + 自动增益：不管麦克风灵敏度高低，波形都能填满。"""
+
+    def __init__(self, n: int = 30):
+        self._buf = deque([0.0] * n, maxlen=n)
+        self._lock = threading.Lock()
+        self._agc = 0.006
+
+    def push(self, peak: float):
+        v = min(1.0, max(0.0, peak))
+        # 慢衰减的峰值包络，约 8 秒半衰期
+        self._agc = max(v, self._agc * 0.985)
+        with self._lock:
+            self._buf.append(v)
+
+    def snapshot(self):
+        """相对峰值归一 + 幂曲线：既有动态，又不会把小噪声画成柱子。"""
+        with self._lock:
+            ref = max(self._agc, 1e-4)
+            out = []
+            for v in self._buf:
+                r = v / ref
+                if r < 0.06:          # 噪声门
+                    out.append(0.0)
+                else:
+                    out.append(min(1.0, r ** 0.55))
+            return out
+
+    def clear(self):
+        with self._lock:
+            self._buf = deque([0.0] * self._buf.maxlen, maxlen=self._buf.maxlen)
+            self._agc = 0.006
+
+
+# ---------------------------------------------------------------- 配色
+
+#            主色              亮色(高光)         暗色(底)
+STATES = {
+    "recording": ((255, 106, 96), (255, 176, 166), (222, 56, 62)),
+    "busy":      ((116, 198, 255), (186, 232, 255), (62, 146, 226)),
+    "done":      ((92, 222, 152), (168, 248, 202), (40, 186, 108)),
+    "error":     ((255, 176, 82), (255, 214, 158), (232, 132, 36)),
+}
+
+ACCENTS = {
+    "recording": (255, 62, 52),
+    "busy": (10, 132, 255),
+    "done": (46, 196, 112),
+    "error": (255, 159, 28),
+}
+
+FONT_FILES = [
+    (r"C:\Windows\Fonts\msyh.ttc", 0),
+    (r"C:\Windows\Fonts\simhei.ttf", 0),
+]
+
+
+def _font(size: int):
+    for path, idx in FONT_FILES:
+        try:
+            return ImageFont.truetype(path, size, index=idx)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+# ---------------------------------------------------------------- Win32
+
+WM_DESTROY = 0x0002
+WM_TIMER = 0x0113
+WLW_ALPHA = 0x00000002
+WS_POPUP = 0x80000000
+WS_EX_LAYERED = 0x00080000
+WS_EX_TOPMOST = 0x00000008
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
+SW_HIDE = 0
+SW_SHOWNOACTIVATE = 4
+DIB_RGB_COLORS = 0
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_void_p, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", wt.UINT), ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+        ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH),
+        ("lpszMenuName", wt.LPCWSTR), ("lpszClassName", wt.LPCWSTR),
+    ]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wt.DWORD), ("biWidth", ctypes.c_long),
+        ("biHeight", ctypes.c_long), ("biPlanes", wt.WORD),
+        ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+        ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", wt.DWORD),
+        ("biClrImportant", wt.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wt.DWORD * 3)]
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [
+        ("BlendOp", ctypes.c_ubyte), ("BlendFlags", ctypes.c_ubyte),
+        ("SourceConstantAlpha", ctypes.c_ubyte), ("AlphaFormat", ctypes.c_ubyte),
+    ]
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+
+def _setup_api():
+    kernel32.GetModuleHandleW.restype = wt.HMODULE
+    kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+    user32.RegisterClassW.restype = wt.ATOM
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    user32.CreateWindowExW.restype = wt.HWND
+    user32.CreateWindowExW.argtypes = [
+        wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wt.HWND, wt.HMENU, wt.HINSTANCE, ctypes.c_void_p,
+    ]
+    user32.DefWindowProcW.restype = ctypes.c_void_p
+    user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+    user32.GetDC.restype = wt.HDC
+    user32.GetDC.argtypes = [wt.HWND]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.SetTimer.restype = ctypes.c_size_t
+    user32.SetTimer.argtypes = [wt.HWND, ctypes.c_size_t, wt.UINT, ctypes.c_void_p]
+    user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+    user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.UpdateLayeredWindow.restype = wt.BOOL
+    user32.UpdateLayeredWindow.argtypes = [
+        wt.HWND, wt.HDC, ctypes.POINTER(POINT), ctypes.POINTER(SIZE),
+        wt.HDC, ctypes.POINTER(POINT), wt.DWORD,
+        ctypes.POINTER(BLENDFUNCTION), wt.DWORD,
+    ]
+    gdi32.CreateCompatibleDC.restype = wt.HDC
+    gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
+    gdi32.CreateDIBSection.restype = wt.HBITMAP
+    gdi32.CreateDIBSection.argtypes = [
+        wt.HDC, ctypes.POINTER(BITMAPINFO), wt.UINT,
+        ctypes.POINTER(ctypes.c_void_p), wt.HANDLE, wt.DWORD,
+    ]
+    gdi32.SelectObject.restype = wt.HGDIOBJ
+    gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+
+
+_setup_api()
+
+
+def _catmull(points, samples: int = 8):
+    if len(points) < 3:
+        return list(points)
+    pts = [points[0]] + list(points) + [points[-1]]
+    out = []
+    for i in range(len(pts) - 3):
+        p0, p1, p2, p3 = pts[i], pts[i + 1], pts[i + 2], pts[i + 3]
+        for j in range(samples):
+            t = j / samples
+            t2, t3 = t * t, t * t * t
+            out.append(0.5 * ((2 * p1) + (-p0 + p2) * t
+                              + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                              + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
+    out.append(points[-1])
+    return out
+
+
+def _dpi_scale() -> float:
+    try:
+        user32.GetDpiForSystem.restype = wt.UINT
+        return max(1.0, user32.GetDpiForSystem() / 96.0)
+    except Exception:
+        return 1.0
+
+
+class WinOverlay:
+    SS = 2          # 超采样倍数
+    PAD_LOGICAL = 40  # 给外发光/投影留的边距（逻辑像素）
+
+    def __init__(self, meter: LevelMeter, cfg: dict | None = None):
+        ui = (cfg or {}).get("ui", {}) if cfg else {}
+        self.meter = meter
+        self.s = _dpi_scale()
+        self.glass = bool(ui.get("glass", True))
+        self.theme = str(ui.get("theme", "light")).lower()
+        self.style = str(ui.get("style", "bars")).lower()
+        self.white_alpha = int(ui.get("tint", 72))
+        self.bottom_margin = int(ui.get("bottom_margin", 92) * self.s)
+
+        self.pad = int(self.PAD_LOGICAL * self.s)
+        self.pill_w = int(ui.get("width", 360) * self.s)
+        self.pill_h = int(ui.get("height", 80) * self.s)
+        self.W = self.pill_w + self.pad * 2
+        self.H = self.pill_h + self.pad * 2
+        self.pill = (self.pad, self.pad, self.W - self.pad, self.H - self.pad)
+        self.radius = self.pill_h // 2
+
+        self._q: queue.Queue = queue.Queue()
+        self._state = "idle"
+        self._text = ""
+        self._state_t = time.time()
+        self._visible = False
+        self._alpha = 0.0
+        self._backdrop = None
+        self._light_mode = self.theme != "dark"
+        self._bg_lum = 200.0
+        self._eff_white = int(self.white_alpha)
+        self._smooth_level = 0.0
+
+        self._hwnd = None
+        self._ready = threading.Event()
+        self._err = None
+        self._thread = None
+        self._wndproc_ref = None
+        self._bitmap = self._memdc = self._bits = self._old_bitmap = None
+        self._scr_dc = None
+        self._x = self._base_y = 0
+
+        self._font_text = _font(int(17 * self.s))
+        self._font_btn = _font(int(17 * self.s))
+        self._chk = {}
+
+    # -------------------------------------------------- 对外
+
+    def start(self, timeout: float = 5.0) -> bool:
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout):
+            raise RuntimeError("悬浮条窗口创建超时")
+        if self._err:
+            raise self._err
+        return True
+
+    def set(self, state: str, text: str = ""):
+        self._q.put((state, text))
+
+    def stop(self):
+        if self._hwnd:
+            try:
+                user32.PostMessageW(self._hwnd, 0x0010, 0, 0)
+            except Exception:
+                pass
+
+    # -------------------------------------------------- 窗口
+
+    def _thread_main(self):
+        try:
+            self._create_window()
+            self._ready.set()
+            user32.SetTimer(self._hwnd, 1, 20, None)
+            msg = wt.MSG()
+            while True:
+                if user32.GetMessageW(ctypes.byref(msg), None, 0, 0) <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            self._err = e
+            self._ready.set()
+
+    def _create_window(self):
+        hinst = kernel32.GetModuleHandleW(None)
+        cls = "VoiceInputGlass"
+        self._wndproc_ref = WNDPROC(self._wndproc)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._wndproc_ref
+        wc.hInstance = hinst
+        wc.lpszClassName = cls
+        user32.RegisterClassW(ctypes.byref(wc))
+
+        ex = (WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+              | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
+        self._hwnd = user32.CreateWindowExW(
+            ex, cls, "overlay", WS_POPUP, 0, 0, self.W, self.H,
+            None, None, hinst, None,
+        )
+        if not self._hwnd:
+            raise OSError(f"CreateWindowExW 失败 {ctypes.get_last_error()}")
+
+        self._scr_dc = user32.GetDC(None)
+        self._memdc = gdi32.CreateCompatibleDC(self._scr_dc)
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = self.W
+        bmi.bmiHeader.biHeight = -self.H
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        bits = ctypes.c_void_p()
+        self._bitmap = gdi32.CreateDIBSection(
+            self._scr_dc, ctypes.byref(bmi), DIB_RGB_COLORS,
+            ctypes.byref(bits), None, 0,
+        )
+        self._bits = bits
+        self._old_bitmap = gdi32.SelectObject(self._memdc, self._bitmap)
+
+        sw = user32.GetSystemMetrics(0)
+        sh = user32.GetSystemMetrics(1)
+        self._x = (sw - self.W) // 2
+        self._base_y = sh - self.H - self.bottom_margin
+
+    def _wndproc(self, hwnd, msg, wp, lp):
+        try:
+            if msg == WM_TIMER:
+                self._tick()
+                return 0
+            if msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+        except Exception:
+            pass
+        return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    # -------------------------------------------------- 动画
+
+    def _tick(self):
+        now = time.time()
+        try:
+            while True:
+                state, text = self._q.get_nowait()
+                self._state = state
+                self._text = text
+                self._state_t = now
+        except queue.Empty:
+            pass
+
+        target = 0.0 if self._state == "idle" else 1.0
+        if self._state in ("done", "error") and now - self._state_t > 1.1:
+            target = 0.0
+
+        dt = 1 / 50
+        step = dt / 0.18 if target > self._alpha else dt / 0.30
+        self._alpha += max(-1.0, min(1.0, target - self._alpha)) * min(1.0, step)
+        self._alpha = max(0.0, min(1.0, self._alpha))
+
+        if self._alpha <= 0.002:
+            if self._visible:
+                user32.ShowWindow(self._hwnd, SW_HIDE)
+                self._visible = False
+                self._chk.pop("base_recording", None)
+            return
+
+        if not self._visible:
+            self._capture_backdrop()
+            self._chk = {k: v for k, v in self._chk.items() if not k.startswith("base")}
+            user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
+            self._visible = True
+
+        self._blit(self._render(now), self._alpha)
+
+    def _compute_white(self, bg_lum: float) -> int:
+        """按背景亮度算白度：背景暗就多加白，背景亮就少加白。
+        目标：合成后的玻璃亮度稳定在 200 左右（亮玻璃 + 深色字的观感）。"""
+        if self.theme == "dark":
+            return int(self.white_alpha * 0.92)
+        target = 242.0
+        if bg_lum >= target - 8:
+            a = float(self.white_alpha)
+        else:
+            a = 255.0 * (target - bg_lum) / max(1.0, 255.0 - bg_lum)
+        return int(max(70, min(215, a)))
+
+    def _capture_backdrop(self):
+        if not self.glass:
+            self._backdrop = None
+            return
+        try:
+            from PIL import ImageGrab
+
+            img = ImageGrab.grab(
+                bbox=(self._x, self._base_y, self._x + self.W, self._base_y + self.H),
+                all_screens=True,
+            ).convert("RGB")
+            tw, th = max(6, self.W // 12), max(6, self.H // 12)
+            small = img.resize((tw, th), Image.BILINEAR).filter(
+                ImageFilter.GaussianBlur(3.0)
+            )
+            glass = small.resize((self.W, self.H), Image.BICUBIC)
+            lum_img = img.convert("L").resize((16, 8), Image.BILINEAR)
+            vals = lum_img.tobytes()
+            self._bg_lum = sum(vals) / max(1, len(vals))
+            self._eff_white = self._compute_white(self._bg_lum)
+
+            if self.theme == "auto":
+                gray = img.convert("L")
+                stat = gray.resize((16, 8), Image.BILINEAR)
+                vals = stat.tobytes()
+                self._light_mode = (sum(vals) / max(1, len(vals))) > 150
+            else:
+                self._light_mode = self.theme != "dark"
+            r, g, b = glass.split()
+            # 提亮一点，玻璃才有通透感
+            lift = lambda v: min(255, int(v * 1.06 + 8))
+            self._backdrop = Image.merge("RGB", (r.point(lift), g.point(lift), b.point(lift)))
+        except Exception:
+            self._backdrop = None
+
+    # -------------------------------------------------- 静态元素
+
+    def _static(self, key, builder):
+        if key not in self._chk:
+            self._chk[key] = builder()
+        return self._chk[key]
+
+    def _geom(self):
+        x0, y0, x1, y1 = self.pill
+        ss = self.SS
+        return (x0 * ss, y0 * ss, x1 * ss, y1 * ss)
+
+    def _mask(self):
+        def build():
+            m = Image.new("L", (self.W * self.SS, self.H * self.SS), 0)
+            ImageDraw.Draw(m).rounded_rectangle(
+                self._geom(), self.radius * self.SS, fill=255
+            )
+            return m
+
+        return self._static("mask", build)
+
+    def _vgrey(self, top: int, bottom: int, size):
+        """竖向 alpha 渐变图。"""
+        w, h = size
+        g = Image.new("L", (1, h))
+        d = ImageDraw.Draw(g)
+        for y in range(h):
+            t = y / max(1, h - 1)
+            d.point((0, y), int(top + (bottom - top) * t))
+        return g.resize((w, h), Image.BILINEAR)
+
+    def _stroke(self, inset: float, width_px: int) -> Image.Image:
+        m = Image.new("L", (self.W * self.SS, self.H * self.SS), 0)
+        g = self._geom()
+        ss = self.SS
+        ImageDraw.Draw(m).rounded_rectangle(
+            [g[0] + inset * ss, g[1] + inset * ss,
+             g[2] - inset * ss, g[3] - inset * ss],
+            max(1, self.radius * ss - inset * ss),
+            outline=255, width=width_px,
+        )
+        return m
+
+    def _base(self):
+        """白色磨砂玻璃：投影 + 透镜背景 + 磨砂白 + 厚玻璃边。"""
+        theme_key = "light" if self._light_mode else "dark"
+
+        def build():
+            import PIL.ImageChops as CH
+
+            ss, W, H = self.SS, self.W, self.H
+            w, h = W * ss, H * ss
+            geom = self._geom()
+            rad = self.radius * ss
+            canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+            # --- 投影：大而软 + 贴身
+            lw, lh = max(8, w // 4), max(8, h // 4)
+            for blur, dy, a in ((8.5, 4.6, 58), (3.0, 1.4, 38), (15.0, 7.0, 20)):
+                sh = Image.new("L", (lw, lh), 0)
+                d = ImageDraw.Draw(sh)
+                d.rounded_rectangle(
+                    [geom[0] / 4, geom[1] / 4 + dy * ss / 4,
+                     geom[2] / 4, geom[3] / 4 + dy * ss / 4],
+                    rad / 4, fill=255,
+                )
+                sh = sh.filter(ImageFilter.GaussianBlur(blur)).resize(
+                    (w, h), Image.BICUBIC
+                )
+                lay = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+                lay.putalpha(sh.point(lambda v, a=a: int(v * a / 255)))
+                canvas.alpha_composite(lay)
+
+            # --- 背景：0.94 缩放采样，像玻璃透镜
+            if self._backdrop is not None:
+                bw, bh = int(W * 0.94), int(H * 0.94)
+                ox, oy = (W - bw) // 2, (H - bh) // 2
+                bg = (self._backdrop
+                      .crop((ox, oy, ox + bw, oy + bh))
+                      .resize((w, h), Image.BICUBIC).convert("RGBA"))
+            else:
+                bg = Image.new("RGBA", (w, h), (236, 238, 242, 255))
+            canvas.paste(bg, (0, 0), self._mask())
+
+            # --- 磨砂层
+            if self._light_mode:
+                rgb, base_a = (252, 253, 255), self._eff_white
+            else:
+                rgb, base_a = (12, 14, 20), int(self.white_alpha * 0.92)
+            tint = Image.new("RGBA", (1, h))
+            td = ImageDraw.Draw(tint)
+            for y in range(h):
+                t = y / max(1, h - 1)
+                a = int(base_a * (1.10 - 0.26 * t))
+                td.point((0, y), rgb + (max(0, min(255, a)),))
+            canvas.alpha_composite(Image.composite(
+                tint.resize((w, h), Image.BILINEAR),
+                Image.new("RGBA", (w, h), (0, 0, 0, 0)), self._mask()))
+
+            # --- 斜向玻璃反光（左上亮 + 右下暗，像凸面玻璃）
+            gw2, gh2 = max(16, w // 6), max(16, h // 6)
+            gl = Image.new("L", (gw2, gh2), 0)
+            ImageDraw.Draw(gl).ellipse(
+                [-gw2 * 0.25, -gh2 * 0.75, gw2 * 0.95, gh2 * 0.9], fill=86
+            )
+            gl = gl.filter(ImageFilter.GaussianBlur(6)).resize((w, h), Image.BICUBIC)
+            gll = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+            gll.putalpha(Image.composite(gl, Image.new("L", (w, h), 0), self._mask()))
+            canvas.alpha_composite(gll)
+
+            sh2 = Image.new("L", (gw2, gh2), 0)
+            ImageDraw.Draw(sh2).ellipse(
+                [gw2 * 0.35, gh2 * 0.55, gw2 * 1.3, gh2 * 1.5], fill=44
+            )
+            sh2 = sh2.filter(ImageFilter.GaussianBlur(6)).resize((w, h), Image.BICUBIC)
+            shl = Image.new("RGBA", (w, h), (40, 44, 56, 0))
+            shl.putalpha(Image.composite(sh2, Image.new("L", (w, h), 0), self._mask()))
+            canvas.alpha_composite(shl)
+
+            # --- 中心偏上的柔和高光（透镜亮斑）
+            hw, hh = 64, 40
+            hl = Image.new("L", (hw, hh), 0)
+            ImageDraw.Draw(hl).ellipse(
+                [-hw * 0.15, -hh * 1.05, hw * 1.15, hh * 1.0], fill=64
+            )
+            hl = hl.filter(ImageFilter.GaussianBlur(9)).resize((w, h), Image.BICUBIC)
+            hi = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+            hi.putalpha(Image.composite(hl, Image.new("L", (w, h), 0), self._mask()))
+            canvas.alpha_composite(hi)
+
+            # --- 厚玻璃边：底部淡暗边 + 顶部亮边 + 内侧高光
+            crisp = self._stroke(0.0, max(2, int(0.9 * self.s * ss)))
+            cl = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            cl.putalpha(crisp.point(lambda v: int(v * 0.20)))
+            canvas.alpha_composite(cl)
+
+            dark_rim = self._stroke(0.0, max(2, int(1.2 * self.s * ss)))
+            dark_a = CH.multiply(dark_rim, self._vgrey(0, 30, (w, h)))
+            dl = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            dl.putalpha(dark_a)
+            canvas.alpha_composite(dl)
+
+            light_rim = self._stroke(0.4, max(2, int(1.1 * self.s * ss)))
+            light_a = CH.multiply(light_rim, self._vgrey(165, 55, (w, h)))
+            ll = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+            ll.putalpha(light_a)
+            canvas.alpha_composite(ll)
+
+            bshadow = self._stroke(1.6, max(3, int(3.0 * self.s * ss)))
+            bs_a = CH.multiply(bshadow, self._vgrey(0, 34, (w, h))).filter(
+                ImageFilter.GaussianBlur(2.2 * ss)
+            )
+            bs_l = Image.new("RGBA", (w, h), (30, 32, 40, 0))
+            bs_l.putalpha(bs_a)
+            canvas.alpha_composite(bs_l)
+
+            inner = self._stroke(1.5, max(2, int(1.2 * self.s * ss)))
+            inner_a = CH.multiply(
+                CH.multiply(inner, self._vgrey(230, 0, (w, h))), self._mask()
+            )
+            il = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+            il.putalpha(inner_a)
+            canvas.alpha_composite(il)
+
+            return canvas
+
+        return self._static(f"base_{theme_key}_{self._eff_white // 12}", build)
+
+    # -------------------------------------------------- 渲染
+
+    def _render(self, now: float) -> Image.Image:
+        ss, W, H = self.SS, self.W, self.H
+        w, h = W * ss, H * ss
+        state = self._state if self._state in STATES else "recording"
+        accent = ACCENTS[state]
+
+        canvas = self._base().copy()
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        cy = h // 2
+        s = self.s * ss
+        px0 = self.pill[0] * ss
+        px1 = self.pill[2] * ss
+
+        ink = (24, 24, 28, 255) if self._light_mode else (245, 245, 248, 255)
+        ink_soft = (48, 48, 56, 255) if self._light_mode else (215, 216, 224, 255)
+
+        # --- 电平
+        levels = self.meter.snapshot() if self._state == "recording" else []
+        lv_now = levels[-1] if levels else 0.0
+        self._smooth_level += (lv_now - self._smooth_level) * 0.3
+
+        # --- 右侧黑色圆按钮
+        btn_r = 28 * s
+        btn_cx = px1 - 7 * s - btn_r
+
+        # --- 左侧状态点
+        dot_x = px0 + 34 * s
+        dot_r = (3.6 + 1.4 * self._smooth_level) * s
+        if self._state == "recording":
+            pulse = 0.5 + 0.5 * math.sin(now * 4.6)
+            dot_r = dot_r * (1.0 + 0.07 * pulse)
+        draw.ellipse([dot_x - dot_r, cy - dot_r, dot_x + dot_r, cy + dot_r],
+                     fill=accent + (255,))
+        draw.ellipse([dot_x - dot_r * 0.55, cy - dot_r * 0.72,
+                      dot_x - dot_r * 0.02, cy - dot_r * 0.16],
+                     fill=(255, 255, 255, 130))
+
+        # --- 文字（识别中/已上屏/出错）
+        label = ""
+        if self._state == "busy":
+            label = "识别中"
+        elif self._state == "done":
+            label = "已上屏"
+        elif self._state == "error":
+            label = self._text or "出错了"
+        label_w = 0
+        if label:
+            label_w = draw.textlength(label, font=self._font_text) + 18 * s
+
+        # --- 波形
+        x0 = px0 + 60 * s
+        x1 = max(x0 + 50 * s, btn_cx - btn_r - label_w - 14 * s)
+        heights = self._levels_to_heights(levels, now)
+        if heights:
+            if self.style == "bars":
+                self._draw_wave(layer, draw, heights, x0, x1, cy, s, ink, accent)
+            else:
+                self._draw_ribbon(layer, draw, heights, x0, x1, cy, s, ink, accent)
+
+        # --- 黑圆按钮
+        draw.ellipse([btn_cx - btn_r, cy - btn_r, btn_cx + btn_r, cy + btn_r],
+                     fill=(15, 15, 17, 255))
+        draw.arc([btn_cx - btn_r + 1.5 * s, cy - btn_r + 1.5 * s,
+                  btn_cx + btn_r - 1.5 * s, cy + btn_r - 1.5 * s],
+                 205, 325, fill=(255, 255, 255, 30),
+                 width=max(1, int(1.3 * s)))
+        if self._state == "recording":
+            el = now - self._state_t
+            txt = f"{int(el // 60)}:{int(el % 60):02d}"
+            draw.text((btn_cx, cy), txt, font=self._font_btn,
+                      fill=(255, 255, 255, 252), anchor="mm")
+        elif self._state == "busy":
+            r = btn_r * 0.42
+            a0 = (now * 380) % 360
+            draw.arc([btn_cx - r, cy - r, btn_cx + r, cy + r], a0, a0 + 260,
+                     fill=(255, 255, 255, 240), width=max(2, int(2.2 * s)))
+        elif self._state == "done":
+            draw.line([(btn_cx - 6.5 * s, cy + 0.5 * s),
+                       (btn_cx - 2.0 * s, cy + 4.8 * s),
+                       (btn_cx + 6.5 * s, cy - 5.0 * s)],
+                      fill=(255, 255, 255, 255), width=max(2, int(2.4 * s)),
+                      joint="curve")
+        else:
+            draw.text((btn_cx, cy), "!", font=self._font_btn,
+                      fill=(255, 255, 255, 252), anchor="mm")
+
+        # --- 标签文字（按钮左侧）
+        if label:
+            draw.text((btn_cx - btn_r - 14 * s, cy), label, font=self._font_text,
+                      fill=ink_soft, anchor="rm")
+
+        canvas.alpha_composite(layer)
+        return canvas.reduce(self.SS) if self.SS > 1 else canvas
+
+    def _levels_to_heights(self, levels, now):
+        n = 26
+        if self._state == "recording" and levels:
+            seq = ([0.0] * n + levels)[-n:]
+            seq = [v * (0.8 + 0.2 * (i / (n - 1))) for i, v in enumerate(seq)]
+            # 3 点平滑，波形看起来是"流淌"的而不是锯齿
+            sm = []
+            for i in range(len(seq)):
+                a = seq[max(0, i - 1)]
+                c = seq[min(len(seq) - 1, i + 1)]
+                sm.append(0.25 * a + 0.5 * seq[i] + 0.25 * c)
+            return sm
+        if self._state == "busy":
+            return [0.16 + 0.30 * (0.5 + 0.5 * math.sin(i * 0.62 - now * 5.2))
+                    for i in range(n)]
+        return []
+
+    def _draw_wave(self, layer, draw, heights, x0, x1, cy, s, ink, accent):
+        n = len(heights)
+        if n < 2:
+            return
+        pitch = (x1 - x0) / n
+        bw = max(1.8 * s, pitch * 0.30)
+        max_h = 32 * s
+        r = bw / 2
+
+        for i, v in enumerate(heights):
+            cx = x0 + (i + 0.5) * pitch
+            hgt = max(2.2 * s, v * max_h)
+            t = i / max(1, n - 1)
+            alpha = int(200 + 55 * (t ** 0.5))
+            col = tuple(int(ink[k] * 0.94 + accent[k] * 0.06) for k in range(3))
+            draw.rounded_rectangle(
+                [cx - bw / 2, cy - hgt / 2, cx + bw / 2, cy + hgt / 2],
+                r, fill=col + (alpha,),
+            )
+
+    def _draw_ribbon(self, layer, draw, heights, x0, x1, cy, s, ink, accent):
+        """平滑连续的对称波形（像录音软件那种），比竖条更"液态"。"""
+        n = len(heights)
+        if n < 3:
+            return
+        max_h = 27 * s
+        smooth = _catmull(heights, 8)
+        m = len(smooth)
+        pts_x = [x0 + (x1 - x0) * (i / (m - 1)) for i in range(m)]
+        half = [max(0.9 * s, v * max_h) for v in smooth]
+
+        top = [(pts_x[i], cy - half[i]) for i in range(m)]
+        bottom = [(pts_x[i], cy + half[i]) for i in reversed(range(m))]
+
+        col = tuple(int(ink[k] * 0.90 + accent[k] * 0.10) for k in range(3))
+        draw.polygon(top + bottom, fill=col + (238,))
+
+        # 上沿一条细高光，边缘更"亮"
+        draw.line(top, fill=(255, 255, 255, 70), width=max(1, int(1.0 * s)),
+                  joint="curve")
+
+    def _label(self, now: float) -> str:
+        if self._state == "recording":
+            el = now - self._state_t
+            return f"{int(el // 60)}:{int(el % 60):02d}"
+        if self._state == "busy":
+            return "识别中"
+        if self._state == "done":
+            return "已上屏"
+        if self._state == "error":
+            return self._text or "出错了"
+        return ""
+
+    def _blit(self, img: Image.Image, alpha: float):
+        if alpha < 0.999:
+            r, g, b, a = img.split()
+            a = a.point(lambda v: int(v * alpha))
+            img = Image.merge("RGBA", (r, g, b, a))
+        data = img.tobytes("raw", "BGRA")
+        ctypes.memmove(self._bits, data, len(data))
+        blend = BLENDFUNCTION(0, 0, 255, 1)
+        dst = POINT(self._x, self._base_y)
+        src = POINT(0, 0)
+        size = SIZE(self.W, self.H)
+        user32.UpdateLayeredWindow(
+            self._hwnd, self._scr_dc, ctypes.byref(dst), ctypes.byref(size),
+            self._memdc, ctypes.byref(src), 0, ctypes.byref(blend), WLW_ALPHA,
+        )
+
+
+# ---------------------------------------------------------------- Tk 备用
+
+
+class TkOverlay:
+    def __init__(self, meter: LevelMeter | None = None, cfg: dict | None = None):
+        import tkinter as tk
+
+        self.meter = meter
+        self.tk = tk
+        self._q: queue.Queue = queue.Queue()
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        try:
+            self.root.attributes("-alpha", 0.93)
+        except Exception:
+            pass
+        self.root.configure(bg="#141414")
+        self.label = tk.Label(
+            self.root, text="", bg="#141414", fg="#f0f0f0",
+            font=("Microsoft YaHei UI", 11), padx=18, pady=9,
+        )
+        self.label.pack()
+        self.root.withdraw()
+
+    def start(self, timeout: float = 5.0) -> bool:
+        return True
+
+    def set(self, state: str, text: str = ""):
+        self._q.put((state, text))
+
+    def stop(self):
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+
+    def _place(self):
+        self.root.update_idletasks()
+        w = max(self.root.winfo_reqwidth(), 200)
+        h = self.root.winfo_reqheight()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self.root.geometry(f"{w}x{h}+{(sw - w) // 2}+{sh - h - 90}")
+
+    def _apply(self, state: str, text: str):
+        colors = {
+            "recording": ("#c0392b", "● 录音中…  松开结束"),
+            "busy": ("#1f6f8b", "⏳ 识别中…"),
+            "done": ("#1e7a3c", "✓ 已上屏"),
+            "error": ("#8e44ad", "⚠ "),
+        }
+        if state == "idle":
+            self.root.withdraw()
+            return
+        bg, default = colors.get(state, ("#141414", ""))
+        self.label.configure(text=(default + text) if state == "error" else default)
+        self.root.configure(bg=bg)
+        self.label.configure(bg=bg)
+        self._place()
+        self.root.deiconify()
+
+    def _tick(self):
+        try:
+            while True:
+                state, text = self._q.get_nowait()
+                self._apply(state, text)
+                if state in ("done", "error"):
+                    self.root.after(900, lambda: self.root.withdraw())
+        except queue.Empty:
+            pass
+        self.root.after(40, self._tick)
+
+    def run(self):
+        self.root.after(40, self._tick)
+        self.root.mainloop()
+
+
+def create_overlay(meter: LevelMeter, cfg: dict | None = None):
+    if sys.platform == "win32":
+        # 1) Skia 版（画质最好）
+        if skia is None:
+            print("[ui] 未安装 skia，使用 Pillow 渲染")
+        else:
+            try:
+                ov = SkiaOverlay(meter, cfg)
+                ov.start()
+                print("[ui] 使用 Skia 渲染")
+                return ov, True
+            except Exception as e:
+                print(f"[warn] Skia 悬浮条不可用，退回 Pillow 版: {e}")
+        # 2) Pillow 版
+        try:
+            ov = WinOverlay(meter, cfg)
+            ov.start()
+            print("[ui] 使用 Pillow 渲染")
+            return ov, True
+        except Exception as e:
+            print(f"[warn] 原生悬浮条不可用，退回 Tk 版本: {e}")
+    return TkOverlay(meter, cfg), False
+
+
+# ==============================================================================
+#  3. 悬浮胶囊（Skia 主渲染器，可用时自动启用）
+# ==============================================================================
+
+import ctypes
+import math
+import queue
+import sys
+import threading
+import time
+from collections import deque
+from ctypes import wintypes as wt
+
+
+
+# ---------------------------------------------------------------- 配色
+
+SK_ACCENTS = {
+    "recording": (255, 64, 54),
+    "busy": (10, 132, 255),
+    "done": (46, 196, 112),
+    "error": (255, 159, 28),
+}
+
+FONT_BOLD = r"C:\Windows\Fonts\msyhbd.ttc"
+FONT_REG = r"C:\Windows\Fonts\msyh.ttc"
+
+
+def C(r, g, b, a=255):
+    return skia.Color(int(r), int(g), int(b), int(a))
+
+
+def _typeface(path: str):
+    try:
+        return skia.Typeface.MakeFromFile(path, 0)
+    except Exception:
+        return skia.Typeface.MakeDefault()
+
+
+WM_POWERBROADCAST = 0x0218
+WM_DISPLAYCHANGE = 0x007E
+WM_DPICHANGED = 0x02E0
+PBT_APMRESUMEAUTOMATIC = 0x0012
+PBT_APMRESUMESUSPEND = 0x0007
+
+# 额外用到的 API（释放/重建图形资源、判断窗口是否还活着）
+if sys.platform == "win32":
+    try:
+        user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+        user32.IsWindow.argtypes = [wt.HWND]
+        user32.IsWindow.restype = wt.BOOL
+        gdi32.DeleteDC.argtypes = [wt.HDC]
+        gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
+        gdi32.DeleteObject.restype = wt.BOOL
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 几何 / 设计令牌
+
+class Design:
+    """所有设计参数集中在这里，改这个就能换风格。"""
+
+    pill_w = 380.0          # 胶囊宽（逻辑像素）
+    pill_h = 76.0           # 胶囊高
+    pad = 34.0              # 窗口留白（给投影/发光）
+
+    # 内容布局（相对胶囊左边界）
+    dot_x = 34.0
+    dot_r = 3.4
+    bars_x0 = 56.0
+    bars_right_pad = 92.0   # 右侧给黑圆留出的宽度
+    bars_n = 26
+    bar_w = 2.4
+    bar_max_h = 28.0        # 波形最大高度（胶囊高的 ~37%）
+
+    circle_r = 23.0
+    circle_right_pad = 8.0
+
+    # 玻璃材质
+    white_top = 0.45
+    white_mid = 0.30
+    white_bot = 0.36
+    spec_alpha = 0.38       # 左上反光强度
+    blur_sigma = 8.0       # 背景磨砂半径（逻辑像素）
+    lens_zoom = 1.05        # 透镜放大
+
+
+class SkiaOverlay:
+    SS = 1  # Skia 自带解析式抗锯齿，1 倍即可（2 倍太慢）
+
+    def __init__(self, meter: LevelMeter, cfg: dict | None = None):
+        ui = (cfg or {}).get("ui", {}) if cfg else {}
+        self.meter = meter
+        try:
+            user32.GetDpiForSystem.restype = wt.UINT
+            self.s = max(1.0, user32.GetDpiForSystem() / 96.0)
+        except Exception:
+            self.s = 1.0
+
+        self.d = Design()
+        if "width" in ui:
+            self.d.pill_w = float(ui["width"])
+        if "height" in ui:
+            self.d.pill_h = float(ui["height"])
+        if "tint" in ui:
+            # tint 越小越透
+            self.d.white_top = min(0.9, max(0.0, ui["tint"] / 255.0 + 0.16))
+            self.d.white_mid = self.d.white_top * 0.65
+            self.d.white_bot = self.d.white_top * 0.82
+        self.d.radius = self.d.pill_h / 2.0
+
+        s = self.s
+        self.pw = int(self.d.pill_w * s)
+        self.ph = int(self.d.pill_h * s)
+        self.pad = int(self.d.pad * s)
+        self.W = self.pw + self.pad * 2
+        self.H = self.ph + self.pad * 2
+
+        self._q: queue.Queue = queue.Queue()
+        self._state = "idle"
+        self._text = ""
+        self._state_t = time.time()
+        self._visible = False
+        self._alpha = 0.0
+        self._glass_img = None
+        self._static = None
+        self._wl = (self.d.white_top, self.d.white_mid, self.d.white_bot)
+        self._smooth = 0.0
+        self._gfx_dirty = False
+        self._blit_fail = 0
+        self._tick_n = 0
+
+        self._hwnd = None
+        self._ready = threading.Event()
+        self._err = None
+        self._thread = None
+        self._wndproc_ref = None
+        self._bitmap = self._memdc = self._bits = self._old_bitmap = None
+        self._scr_dc = None
+        self._x = self._base_y = 0
+
+        self._tf_bold = _typeface(FONT_BOLD)
+        self._tf_reg = _typeface(FONT_REG)
+        self._font_btn = skia.Font(self._tf_bold, 14.0 * s * self.SS)
+        self._font_msg = skia.Font(self._tf_reg, 17.0 * s * self.SS)
+        self._paint_cache = {}
+
+    # -------------------------------------------------- 对外
+    def start(self, timeout: float = 6.0) -> bool:
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout):
+            raise RuntimeError("Skia 悬浮条创建超时")
+        if self._err:
+            raise self._err
+        return True
+
+    def set(self, state: str, text: str = ""):
+        self._q.put((state, text))
+
+    def stop(self):
+        if self._hwnd:
+            try:
+                user32.PostMessageW(self._hwnd, 0x0010, 0, 0)
+            except Exception:
+                pass
+
+    # -------------------------------------------------- Win32 窗口
+    def _thread_main(self):
+        try:
+            self._create_window()
+            self._ready.set()
+            user32.SetTimer(self._hwnd, 1, 20, None)
+            msg = wt.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            self._err = e
+            self._ready.set()
+
+    def _create_window(self):
+        hinst = kernel32.GetModuleHandleW(None)
+        cls = "VoiceInputSkia"
+        self._wndproc_ref = WNDPROC(self._wndproc)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._wndproc_ref
+        wc.hInstance = hinst
+        wc.lpszClassName = cls
+        user32.RegisterClassW(ctypes.byref(wc))
+
+        ex = (WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+              | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
+        self._hwnd = user32.CreateWindowExW(
+            ex, cls, "overlay", WS_POPUP, 0, 0, self.W, self.H,
+            None, None, hinst, None)
+        if not self._hwnd:
+            raise OSError(f"CreateWindowExW 失败 {ctypes.get_last_error()}")
+
+        self._init_graphics()
+        self._update_position()
+
+    # -------------------------------------------------- 图形资源（睡眠/换分辨率后要重建）
+    def _init_graphics(self):
+
+        self._scr_dc = user32.GetDC(None)
+        self._memdc = gdi32.CreateCompatibleDC(self._scr_dc)
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = self.W
+        bmi.bmiHeader.biHeight = -self.H
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        bits = ctypes.c_void_p()
+        self._bitmap = gdi32.CreateDIBSection(
+            self._scr_dc, ctypes.byref(bmi), DIB_RGB_COLORS,
+            ctypes.byref(bits), None, 0)
+        self._bits = bits
+        self._old_bitmap = gdi32.SelectObject(self._memdc, self._bitmap)
+
+    def _update_position(self):
+        sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        self._x = (sw - self.W) // 2
+        self._base_y = sh - self.H - int(92 * self.s)
+
+    def _release_graphics(self):
+        try:
+            if self._memdc and self._old_bitmap:
+                gdi32.SelectObject(self._memdc, self._old_bitmap)
+            if self._memdc:
+                gdi32.DeleteDC(self._memdc)
+            if self._bitmap:
+                gdi32.DeleteObject(self._bitmap)
+            if self._scr_dc:
+                user32.ReleaseDC(None, self._scr_dc)
+        except Exception:
+            pass
+        self._scr_dc = None
+        self._memdc = None
+        self._bitmap = None
+        self._old_bitmap = None
+        self._bits = None
+
+    def _rebuild_graphics(self):
+        """重建 DC / DIB / 静态层，并强制重新显示（睡眠唤醒后必做）。"""
+        self._release_graphics()
+        try:
+            self._init_graphics()
+            self._update_position()
+        except Exception as e:
+            print(f"[warn] 重建图形资源失败: {e}")
+        self._static = None
+        self._glass_img = None
+        self._visible = False
+        self._blit_fail = 0
+        self._gfx_dirty = False
+
+    def _recreate_window(self):
+        """窗口句柄都没了（会话切换/桌面重建）时整个重来。"""
+        hwnd = self._hwnd
+        self._hwnd = None
+        try:
+            if hwnd:
+                user32.DestroyWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            self._create_window()
+            print("[ui] 悬浮条已重建")
+        except Exception as e:
+            print(f"[warn] 重建悬浮条失败: {e}")
+
+    def _wndproc(self, hwnd, msg, wp, lp):
+        try:
+            if msg == WM_TIMER:
+                self._tick()
+                return 0
+            if msg == WM_POWERBROADCAST:
+                # 从睡眠/休眠恢复：图形资源很可能已经失效
+                if wp in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
+                    self._gfx_dirty = True
+                return 1
+            if msg in (WM_DISPLAYCHANGE, WM_DPICHANGED):
+                # 分辨率/缩放变了（外接显示器、投影、缩放调整）
+                self._gfx_dirty = True
+                return 0
+            if msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+        except Exception:
+            pass
+        return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    # -------------------------------------------------- 动画
+    def _tick(self):
+        now = time.time()
+        self._tick_n += 1
+
+        # 图形资源失效（睡眠唤醒/换分辨率）→ 重建
+        if self._gfx_dirty:
+            self._rebuild_graphics()
+
+        # 每秒核对一次窗口是否还活着
+        if self._tick_n % 50 == 0 and self._hwnd:
+            try:
+                if not user32.IsWindow(self._hwnd):
+                    self._recreate_window()
+            except Exception:
+                pass
+
+        try:
+            while True:
+                state, text = self._q.get_nowait()
+                self._state = state
+                self._text = text
+                self._state_t = now
+        except queue.Empty:
+            pass
+
+        target = 0.0 if self._state == "idle" else 1.0
+        if self._state in ("done", "error") and now - self._state_t > 1.1:
+            target = 0.0
+
+        dt = 1 / 50
+        step = dt / 0.18 if target > self._alpha else dt / 0.30
+        self._alpha += max(-1.0, min(1.0, target - self._alpha)) * min(1.0, step)
+        self._alpha = max(0.0, min(1.0, self._alpha))
+
+        if self._alpha <= 0.002:
+            if self._visible:
+                user32.ShowWindow(self._hwnd, SW_HIDE)
+                self._visible = False
+                self._glass_img = None
+                self._static = None
+            return
+
+        if not self._visible:
+            if self._gfx_dirty:          # 极端情况：还没重建就先跳过这一帧
+                return
+            self._capture_backdrop()
+            self._static = None
+            user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
+            self._visible = True
+            self._blit_fail = 0
+
+        try:
+            ok = self._blit(self._render(now), self._alpha)
+        except Exception as e:
+            ok = False
+            print(f"[warn] 绘制失败: {e}")
+
+        if not ok:
+            self._blit_fail += 1
+            if self._blit_fail >= 3:
+                print("[warn] 悬浮条连续绘制失败，重建图形资源")
+                self._gfx_dirty = True
+
+    # -------------------------------------------------- 背景磨砂（每次出现时算一次）
+    def _capture_backdrop(self):
+        self._glass_img = None
+        try:
+            import numpy as np
+            from PIL import Image, ImageGrab
+
+            img = ImageGrab.grab(
+                bbox=(self._x, self._base_y, self._x + self.W, self._base_y + self.H),
+                all_screens=True,
+            ).convert("RGB")
+            # 自适应白度：背景暗就多加白，保证始终是"亮玻璃 + 深色内容"
+            small = img.convert("L").resize((16, 8), Image.BILINEAR)
+            v = small.tobytes()
+            bg = sum(v) / max(1, len(v))
+            target = 226.0
+            if bg >= target - 6:
+                w = self.d.white_top
+            else:
+                w = (target - bg) / max(1.0, 255.0 - bg)
+            w = max(0.30, min(0.88, w))
+            self._wl = (w, w * 0.72, w * 0.84)
+            arr = np.asarray(img, dtype=np.uint8)
+            rgba = np.dstack([arr, np.full(arr.shape[:2], 255, dtype=np.uint8)])
+            src = skia.Image.fromarray(rgba, colorType=skia.kRGBA_8888_ColorType)
+
+            surf = skia.Surface(self.W, self.H)
+            c = surf.getCanvas()
+            c.clear(skia.ColorTRANSPARENT)
+            p = skia.Paint()
+            sg = self.d.blur_sigma * self.s
+            p.setImageFilter(skia.ImageFilters.Blur(sg, sg, skia.TileMode.kDecal))
+            c.drawImage(src, 0, 0, skia.SamplingOptions(), p)
+            self._glass_img = surf.makeImageSnapshot()
+        except Exception as e:
+            print(f"[warn] 背景磨砂失败（用纯色玻璃代替）: {e}")
+            self._glass_img = None
+
+    # -------------------------------------------------- 绘制辅助
+    def _rr(self, x, y, w, h, r):
+        return skia.RRect.MakeRectXY(skia.Rect.MakeXYWH(x, y, w, h), r, r)
+
+    def _glass_paint(self, ss):
+        p = skia.Paint(AntiAlias=True)
+        p.setShader(skia.GradientShader.MakeLinear(
+            [skia.Point(0, 0), skia.Point(0, self.ph * ss)],
+            [C(255, 255, 255, int(255 * self._wl[0])),
+             C(255, 255, 255, int(255 * self._wl[1])),
+             C(255, 255, 255, int(255 * self._wl[2]))],
+            [0.0, 0.55, 1.0]))
+        return p
+
+    # -------------------------------------------------- 静态层（投影 + 玻璃 + 边）
+    def _build_static(self):
+        ss = self.SS
+        s = self.s * ss
+        W, H = self.W * ss, self.H * ss
+        surf = skia.Surface(W, H)
+        c = surf.getCanvas()
+        c.clear(skia.ColorTRANSPARENT)
+
+        px, py = self.pad * ss, self.pad * ss
+        pw, ph = self.pw * ss, self.ph * ss
+        radius = self.d.radius * s
+        body = self._rr(px, py, pw, ph, radius)
+
+        for dy, sigma, alpha in ((1.0, 1.6, 0.12), (4.0, 7.0, 0.10), (14.0, 22.0, 0.12)):
+            sp = skia.Paint(AntiAlias=True, Color=C(8, 10, 16, int(255 * alpha)))
+            sp.setMaskFilter(skia.MaskFilter.MakeBlur(skia.kNormal_BlurStyle, sigma * s))
+            c.save()
+            c.translate(0, dy * s)
+            c.drawRRect(body, sp)
+            c.restore()
+
+        c.save()
+        c.clipRRect(body, True)
+        if self._glass_img is not None:
+            z = self.d.lens_zoom
+            dw, dh = pw * z, ph * z
+            dst = skia.Rect.MakeXYWH(px - (dw - pw) / 2, py - (dh - ph) / 2, dw, dh)
+            c.drawImageRect(self._glass_img,
+                            skia.Rect.MakeWH(self._glass_img.width(),
+                                             self._glass_img.height()),
+                            dst, skia.SamplingOptions(skia.FilterMode.kLinear),
+                            skia.Paint())
+        else:
+            c.drawRect(skia.Rect.MakeXYWH(px, py, pw, ph),
+                       skia.Paint(AntiAlias=True, Color=C(226, 229, 234, 235)))
+
+        c.drawRect(skia.Rect.MakeXYWH(px, py, pw, ph), self._glass_paint(ss))
+
+        spec = skia.Paint(AntiAlias=True)
+        spec.setShader(skia.GradientShader.MakeRadial(
+            skia.Point(px + pw * 0.26, py - ph * 0.10),
+            pw * 0.72,
+            [C(255, 255, 255, int(255 * self.d.spec_alpha)),
+             C(255, 255, 255, int(255 * self.d.spec_alpha * 0.3)),
+             C(255, 255, 255, 0)],
+            [0.0, 0.45, 1.0]))
+        c.drawRect(skia.Rect.MakeXYWH(px, py, pw, ph), spec)
+        c.restore()
+
+        c.drawRRect(body, skia.Paint(
+            AntiAlias=True, Style=skia.Paint.kStroke_Style,
+            StrokeWidth=1.0 * s, Color=C(20, 24, 32, 28)))
+
+        top_rim = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                             StrokeWidth=1.3 * s)
+        top_rim.setShader(skia.GradientShader.MakeLinear(
+            [skia.Point(0, py), skia.Point(0, py + ph)],
+            [C(255, 255, 255, 235), C(255, 255, 255, 120), C(255, 255, 255, 40)],
+            [0.0, 0.35, 1.0]))
+        inset = 0.7 * s
+        c.drawRRect(self._rr(px + inset, py + inset, pw - inset * 2,
+                             ph - inset * 2, radius - inset), top_rim)
+
+        bot = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                         StrokeWidth=3.0 * s)
+        bot.setShader(skia.GradientShader.MakeLinear(
+            [skia.Point(0, py), skia.Point(0, py + ph)],
+            [C(30, 34, 44, 0), C(30, 34, 44, 10), C(30, 34, 44, 42)],
+            [0.0, 0.6, 1.0]))
+        bot.setMaskFilter(skia.MaskFilter.MakeBlur(skia.kNormal_BlurStyle, 1.6 * s))
+        ins2 = 2.0 * s
+        c.drawRRect(self._rr(px + ins2, py + ins2, pw - ins2 * 2,
+                             ph - ins2 * 2, radius - ins2), bot)
+
+        return surf.makeImageSnapshot()
+
+    # -------------------------------------------------- 每帧渲染（只画内容）
+    def _render(self, now: float):
+        ss = self.SS
+        s = self.s * ss
+        W, H = self.W * ss, self.H * ss
+        if self._static is None:
+            self._static = self._build_static()
+
+        surf = skia.Surface(W, H)
+        c = surf.getCanvas()
+        c.clear(skia.ColorTRANSPARENT)
+        c.drawImage(self._static, 0, 0)
+
+        px, py = self.pad * ss, self.pad * ss
+        pw, ph = self.pw * ss, self.ph * ss
+        radius = self.d.radius * s
+        body = self._rr(px, py, pw, ph, radius)
+        cy = py + ph / 2
+
+        accent = SK_ACCENTS.get(self._state, SK_ACCENTS["recording"])
+        ink = C(26, 26, 30, 255)
+
+        levels = self.meter.snapshot() if self._state == "recording" else []
+        lv = levels[-1] if levels else 0.0
+        self._smooth += (lv - self._smooth) * 0.3
+
+        dr = self.d.dot_r * s * (1.0 + (0.08 * math.sin(now * 4.6)
+                                        if self._state == "recording" else 0.0))
+        dx = px + self.d.dot_x * s
+        c.drawCircle(dx, cy, dr, skia.Paint(AntiAlias=True, Color=C(*accent, 255)))
+        c.drawCircle(dx - dr * 0.30, cy - dr * 0.34, dr * 0.30,
+                     skia.Paint(AntiAlias=True, Color=C(255, 255, 255, 115)))
+
+        heights = self._heights(levels, now)
+        if heights:
+            c.save()
+            c.clipRRect(body, True)
+            x0 = px + self.d.bars_x0 * s
+            x1 = px + pw - self.d.bars_right_pad * s
+            self._draw_bars(c, heights, x0, x1, cy, s, ink, accent)
+            c.restore()
+
+        cr = self.d.circle_r * s
+        ccx = px + pw - (self.d.circle_right_pad * s + cr)
+        c.drawCircle(ccx, cy, cr, skia.Paint(AntiAlias=True, Color=C(16, 16, 18, 255)))
+        ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                          StrokeWidth=1.2 * s)
+        ring.setShader(skia.GradientShader.MakeLinear(
+            [skia.Point(ccx - cr, cy - cr), skia.Point(ccx + cr, cy + cr)],
+            [C(255, 255, 255, 55), C(255, 255, 255, 0)]))
+        c.drawCircle(ccx, cy, cr - 0.8 * s, ring)
+
+        if self._state == "recording":
+            el = now - self._state_t
+            self._center_text(c, "%d:%02d" % (int(el // 60), int(el % 60)),
+                              ccx, cy, self._font_btn, C(255, 255, 255, 250))
+        elif self._state == "busy":
+            ar = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                            StrokeWidth=2.2 * s, Color=C(255, 255, 255, 235))
+            ar.setStrokeCap(skia.Paint.kRound_Cap)
+            a0 = (now * 400) % 360
+            r = cr * 0.42
+            c.drawArc(skia.Rect.MakeXYWH(ccx - r, cy - r, r * 2, r * 2),
+                      a0, 265, False, ar)
+        elif self._state == "done":
+            ck = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                            StrokeWidth=2.4 * s, Color=C(255, 255, 255, 255))
+            ck.setStrokeCap(skia.Paint.kRound_Cap)
+            ck.setStrokeJoin(skia.Paint.kRound_Join)
+            path = skia.Path()
+            path.moveTo(ccx - 6.2 * s, cy + 0.4 * s)
+            path.lineTo(ccx - 1.8 * s, cy + 4.6 * s)
+            path.lineTo(ccx + 6.2 * s, cy - 4.8 * s)
+            c.drawPath(path, ck)
+        else:
+            self._center_text(c, "!", ccx, cy, self._font_btn, C(255, 255, 255, 250))
+
+        if self._state in ("done", "error"):
+            msg = "已上屏" if self._state == "done" else (self._text or "出错了")
+            painter_cx = (px + self.d.dot_x * s + ccx - cr) / 2
+            f = self._font_msg
+            while f.measureText(msg) > (ccx - cr - (px + self.d.dot_x * s) - 40 * s) and msg:
+                msg = msg[:-1]
+            if msg:
+                self._center_text(c, msg, painter_cx, cy, f, ink)
+
+        img = surf.makeImageSnapshot()
+        if ss > 1:
+            small = skia.Surface(self.W, self.H)
+            sc = small.getCanvas()
+            sc.clear(skia.ColorTRANSPARENT)
+            sc.drawImageRect(img,
+                             skia.Rect.MakeWH(img.width(), img.height()),
+                             skia.Rect.MakeWH(self.W, self.H),
+                             skia.SamplingOptions(skia.CubicResampler.Mitchell()),
+                             skia.Paint())
+            img = small.makeImageSnapshot()
+        return img
+
+    def _heights(self, levels, now):
+        n = self.d.bars_n
+        if self._state == "recording" and levels:
+            seq = ([0.0] * n + levels)[-n:]
+            seq = [v * (0.8 + 0.2 * (i / (n - 1))) for i, v in enumerate(seq)]
+            sm = []
+            for i in range(len(seq)):
+                a = seq[max(0, i - 1)]
+                b = seq[min(len(seq) - 1, i + 1)]
+                sm.append(0.25 * a + 0.5 * seq[i] + 0.25 * b)
+            return sm
+        if self._state == "busy":
+            return [0.16 + 0.30 * (0.5 + 0.5 * math.sin(i * 0.62 - now * 5.2))
+                    for i in range(n)]
+        return []
+
+    def _draw_bars(self, c, heights, x0, x1, cy, s, ink, accent):
+        n = len(heights)
+        if n < 2:
+            return
+        pitch = (x1 - x0) / n
+        bw = max(1.8 * s, self.d.bar_w * s)
+        max_h = self.d.bar_max_h * s
+        for i, v in enumerate(heights):
+            cx = x0 + (i + 0.5) * pitch
+            h = max(2.2 * s, v * max_h)
+            t = i / max(1, n - 1)
+            col = C(int(26 + accent[0] * 0.08), int(26 + accent[1] * 0.08),
+                    int(30 + accent[2] * 0.08), int(150 + 105 * (t ** 0.6)))
+            c.drawRRect(self._rr(cx - bw / 2, cy - h / 2, bw, h, bw / 2),
+                        skia.Paint(AntiAlias=True, Color=col))
+
+    def _center_text(self, c, text, cx, cy, font, color):
+        w = font.measureText(text)
+        m = font.getMetrics()
+        y = cy - (m.fAscent + m.fDescent) / 2
+        c.drawString(text, cx - w / 2, y,
+                     font, skia.Paint(AntiAlias=True, Color=color))
+
+    # -------------------------------------------------- 上屏
+    def _blit(self, img, alpha: float):
+        # 输出的就是预乘 BGRA，正好是 UpdateLayeredWindow 要的格式
+        arr = img.toarray(colorType=skia.kBGRA_8888_ColorType,
+                          alphaType=skia.kPremul_AlphaType)
+        if alpha < 0.999:
+            arr = arr.copy()
+            arr[..., :] = (arr.astype("float32") * alpha).astype("uint8")
+        ctypes.memmove(self._bits, arr.tobytes(), arr.nbytes)
+        blend = BLENDFUNCTION(0, 0, 255, 1)
+        dst = POINT(self._x, self._base_y)
+        src = POINT(0, 0)
+        size = SIZE(self.W, self.H)
+        return bool(user32.UpdateLayeredWindow(
+            self._hwnd, self._scr_dc, ctypes.byref(dst), ctypes.byref(size),
+            self._memdc, ctypes.byref(src), 0, ctypes.byref(blend), WLW_ALPHA))
+
+
+# ==============================================================================
+#  4. 系统托盘
+# ==============================================================================
+
+import os
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageDraw
+
+try:
+    import pystray
+except Exception:  # 没装就自动跳过，不影响主功能
+    pystray = None
+
+APP_NAME = "LocalVoiceInput"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+# ---------------------------------------------------------------- 图标
+
+
+def _icon_image(color, paused: bool = False, size: int = 64) -> Image.Image:
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    pad = 3
+    d.rounded_rectangle(
+        [pad, pad, size - pad, size - pad], int(size * 0.26),
+        fill=(34, 36, 44, 255), outline=(255, 255, 255, 40), width=1,
+    )
+    c = color if not paused else (120, 122, 130)
+    # 话筒胶囊
+    w, h = size * 0.20, size * 0.30
+    cx, cy = size * 0.5, size * 0.42
+    d.rounded_rectangle(
+        [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], w / 2, fill=c + (255,)
+    )
+    # 支架弧线
+    aw = size * 0.30
+    ay = size * 0.50
+    d.arc(
+        [cx - aw / 2, ay - h * 0.15, cx + aw / 2, ay + h * 0.75],
+        start=0, end=180, fill=c + (255,), width=max(2, int(size * 0.05)),
+    )
+    # 底座
+    d.line(
+        [(cx, size * 0.80), (cx, size * 0.86)],
+        fill=c + (255,), width=max(2, int(size * 0.05)),
+    )
+    d.line(
+        [(cx - size * 0.12, size * 0.86), (cx + size * 0.12, size * 0.86)],
+        fill=c + (255,), width=max(2, int(size * 0.05)),
+    )
+    if paused:
+        d.line(
+            [(size * 0.34, size * 0.66), (size * 0.66, size * 0.34)],
+            fill=(255, 90, 90, 255), width=max(3, int(size * 0.07)),
+        )
+    return img
+
+
+ICONS = {
+    "idle": _icon_image((150, 200, 255)),
+    "recording": _icon_image((255, 82, 82)),
+    "busy": _icon_image((64, 165, 245)),
+    "done": _icon_image((52, 199, 123)),
+    "paused": _icon_image((150, 200, 255), paused=True),
+}
+
+
+# ---------------------------------------------------------------- 开机自启
+
+
+def _launch_command() -> str:
+    if getattr(sys, 'frozen', False):   # PyInstaller 打包后直接指向 exe
+        return f'"{Path(sys.executable)}"'
+    exe = Path(sys.executable)
+    pyw = exe.with_name("pythonw.exe")
+    runner = pyw if pyw.exists() else exe
+    return f'"{runner}" "{ROOT / "voice_input.py"}"'
+
+
+def autostart_enabled() -> bool:
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            v, _ = winreg.QueryValueEx(k, APP_NAME)
+            return bool(v)
+    except Exception:
+        return False
+
+
+def set_autostart(enable: bool):
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
+        ) as k:
+            if enable:
+                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, _launch_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, APP_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception as e:
+        print(f"[warn] 设置开机自启失败: {e}")
+        return False
+
+
+# ---------------------------------------------------------------- 托盘
+
+
+class Tray:
+    def __init__(self, app):
+        self.app = app
+        self.icon = None
+        self._state = "idle"
+
+    # ---- 供 App 调用
+    def set_state(self, state: str):
+        """idle / recording / busy / done / paused"""
+        if not self.icon:
+            return
+        if state == self._state:
+            return
+        self._state = state
+        key = "paused" if self.app.paused else state
+        self.icon.icon = ICONS.get(key, ICONS["idle"])
+        self.icon.title = {
+            "idle": "本地语音输入 · 待命",
+            "recording": "本地语音输入 · 录音中",
+            "busy": "本地语音输入 · 识别中",
+            "done": "本地语音输入 · 已上屏",
+            "paused": "本地语音输入 · 已暂停",
+        }.get(key, "本地语音输入")
+        try:
+            self.icon.update_menu()
+        except Exception:
+            pass
+
+    def start(self) -> bool:
+        if pystray is None:
+            print("[warn] 没装 pystray，托盘不可用")
+            return False
+        menu = pystray.Menu(
+            pystray.MenuItem(
+                lambda item: "已暂停（点击恢复）" if self.app.paused else "暂停监听",
+                self._toggle_pause,
+                checked=lambda item: self.app.paused,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "开机自启",
+                self._toggle_autostart,
+                checked=lambda item: autostart_enabled(),
+            ),
+            pystray.MenuItem("打开配置", self._open_config),
+            pystray.MenuItem("查看日志", self._open_logs),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("退出", self._quit),
+        )
+        self.icon = pystray.Icon(
+            "voice_input",
+            ICONS["idle"],
+            "本地语音输入 · 待命",
+            menu,
+        )
+        self.icon.run_detached()
+        return True
+
+    def stop(self):
+        """非阻塞停止：pystray 的 stop 偶尔会卡住，丢到线程里。"""
+        if not self.icon:
+            return
+        import threading
+
+        icon = self.icon
+        self.icon = None
+
+        def _do():
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_do, daemon=True)
+        t.start()
+        t.join(1.5)
+
+    # ---- 菜单回调
+    def _toggle_pause(self, icon=None, item=None):
+        self.app.set_paused(not self.app.paused)
+        self.set_state(self._state)
+
+    def _toggle_autostart(self, icon=None, item=None):
+        set_autostart(not autostart_enabled())
+
+    def _open_config(self, icon=None, item=None):
+        try:
+            os.startfile(str(ROOT / "config.toml"))
+        except Exception as e:
+            print(f"[warn] 打开配置失败: {e}")
+
+    def _open_logs(self, icon=None, item=None):
+        try:
+            os.startfile(str(ROOT))
+        except Exception as e:
+            print(f"[warn] 打开目录失败: {e}")
+
+    def _quit(self, icon=None, item=None):
+        self.app.quit()
+
+
+# ==============================================================================
+#  5. 命令行工具：--setup（一键准备）/ --test（测链路）/ --make-icon
+# ==============================================================================
+
+LLAMA_BUILD = "b11304"
+LLAMA_ASSETS = {
+    # backend: (主程序包, 额外运行库包)
+    "cuda":   ("llama-{b}-bin-win-cuda-12.4-x64.zip",
+               "cudart-llama-bin-win-cuda-12.4-x64.zip"),
+    "vulkan": ("llama-{b}-bin-win-vulkan-x64.zip", None),
+    "cpu":    ("llama-{b}-bin-win-cpu-x64.zip", None),
+}
+LLAMA_URL = "https://github.com/ggml-org/llama.cpp/releases/download/{b}/{asset}"
+
+HF = "https://huggingface.co"
+MODEL_FILES = {
+    "asr": [
+        ("ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main/Qwen3-ASR-1.7B-Q8_0.gguf",
+         "Qwen3-ASR-1.7B-Q8_0.gguf", "ASR 识别模型 (Q8_0, 2.2 GB)"),
+        ("ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+         "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf", "ASR 音频编码器 (0.34 GB)"),
+    ],
+    "polish": [
+        ("unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+         "Qwen3.5-4B-Q4_K_M.gguf", "润色模型 (Q4_K_M, 2.9 GB)"),
+    ],
+}
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def download(url: str, dest: Path, label: str) -> bool:
+    """带断点续传和进度显示的下载。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    if dest.exists() and not part.exists():
+        print(f"[skip] {label}  已存在 ({human(dest.stat().st_size)})")
+        return True
+
+    start = part.stat().st_size if part.exists() else 0
+    req = urllib.request.Request(url, headers={"User-Agent": "voice-input/1.0"})
+    if start:
+        req.add_header("Range", f"bytes={start}-")
+        print(f"[resume] {label}  从 {human(start)} 继续")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            if r.status == 200 and start:      # 服务端不支持 Range
+                start = 0
+                part.unlink(missing_ok=True)
+            total = int(r.headers.get("Content-Length") or 0)
+            total = total + start if r.status == 206 else total
+            print(f"[get ] {label}  {human(total) if total else ''}")
+            done, t0, last = start, time.time(), 0.0
+            with open(part, "ab" if start else "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    now = time.time()
+                    if now - last >= 0.5:
+                        last = now
+                        speed = (done - start) / max(1e-6, now - t0)
+                        pct = f"{done * 100 / total:5.1f}%" if total else "  ?  "
+                        eta = f"  ETA {(total - done) / max(1e-6, speed):.0f}s" if total and speed else ""
+                        print(f"\r       {pct}  {human(done)} / {human(total) if total else '?'}"
+                              f"  {human(speed)}/s{eta}", end="", flush=True)
+            print()
+            if total and done < total:
+                print(f"[warn] {label} 不完整，重跑可续传")
+                return False
+    except urllib.error.HTTPError as e:
+        if e.code != 416:
+            print(f"\n[err ] {label}: HTTP {e.code} {e.reason}")
+            return False
+    except Exception as e:
+        print(f"\n[err ] {label}: {type(e).__name__}: {e}")
+        return False
+
+    part.replace(dest)
+    print(f"[ok  ] {label}  ->  {dest.relative_to(ROOT)}")
+    return True
+
+
+def _extract_zip(zip_path: Path, dest: Path):
+    """解压；如果压缩包只有一个顶层目录，去掉这层。"""
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as z:
+        names = [n for n in z.namelist() if n and not n.endswith("/")]
+        tops = {n.split("/")[0] for n in names}
+        strip = len(tops) == 1 and all("/" in n for n in names)
+        top = next(iter(tops)) if strip else ""
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            if strip:
+                if not name.startswith(top + "/"):
+                    continue
+                name = name[len(top) + 1:]
+            target = dest / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(info) as src, open(target, "wb") as out:
+                while True:
+                    buf = src.read(1 << 20)
+                    if not buf:
+                        break
+                    out.write(buf)
+
+
+def fetch_llama(backend: str = "cuda") -> bool:
+    exe = ROOT / "llama" / "llama-server.exe"
+    if exe.exists():
+        print("[skip] llama.cpp 已就绪: llama\\llama-server.exe")
+        return True
+    if backend not in LLAMA_ASSETS:
+        print(f"[err ] 未知后端: {backend}")
+        return False
+
+    main_asset, cudart = LLAMA_ASSETS[backend]
+    tmp = ROOT / "_download"
+    tmp.mkdir(parents=True, exist_ok=True)
+    ok = True
+    for asset in [main_asset.format(b=LLAMA_BUILD), cudart]:
+        if not asset:
+            continue
+        url = LLAMA_URL.format(b=LLAMA_BUILD, asset=asset)
+        zip_path = tmp / asset
+        if not download(url, zip_path, f"llama.cpp {backend}  {asset}"):
+            return False
+        try:
+            _extract_zip(zip_path, ROOT / "llama")
+            zip_path.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"[err ] 解压失败 {asset}: {e}")
+            ok = False
+    if ok and not exe.exists():
+        print("[err ] 解压后没找到 llama\\llama-server.exe，请手动检查")
+        ok = False
+    try:
+        tmp.rmdir()
+    except Exception:
+        pass
+    return ok
+
+
+def fetch_models(only: str | None = None, endpoint: str | None = None) -> bool:
+    endpoint = (endpoint or os.environ.get("HF_ENDPOINT") or HF).rstrip("/")
+    groups = [only] if only else ["asr", "polish"]
+    print(f"模型目录: {ROOT / 'models'}\n下载源  : {endpoint}\n")
+    ok = True
+    for group in groups:
+        for path, name, label in MODEL_FILES[group]:
+            ok = download(f"{endpoint}/{path}", ROOT / "models" / name, label) and ok
+    return ok
+
+
+def ensure_deps() -> bool:
+    need = []
+    for mod, pkg in [("numpy", "numpy"), ("sounddevice", "sounddevice"),
+                     ("pyperclip", "pyperclip"), ("pynput", "pynput"),
+                     ("PIL", "Pillow"), ("pystray", "pystray")]:
+        try:
+            __import__(mod)
+        except Exception:
+            need.append(pkg)
+    if not need:
+        return True
+    print(f"[pip ] 缺少依赖: {', '.join(need)}，正在安装…")
+    req = ROOT / "requirements.txt"
+    cmd = ([sys.executable, "-m", "pip", "install", "-r", str(req)]
+           if req.exists() else [sys.executable, "-m", "pip", "install", *need])
+    if subprocess.call(cmd) != 0:
+        print("[err ] 依赖安装失败，请手动运行: pip install -r requirements.txt")
+        return False
+    return True
+
+
+def setup_all(args) -> int:
+    print("=" * 60)
+    print("  一次性准备：llama.cpp → 模型")
+    print("=" * 60 + "\n")
+    ok = True
+    if not args.no_llama:
+        ok = fetch_llama(args.backend) and ok
+    if not args.no_models:
+        ok = fetch_models(args.only) and ok
+    print()
+    if ok:
+        print("准备完成。双击 VoiceInput.bat 或运行 python voice_input.py 即可。")
+        return 0
+    print("有步骤失败，修好后重跑：python voice_input.py --setup")
+    return 1
+
+
+def check_env() -> int:
+    """检查 llama.cpp 和模型是否就位；0 = 可以启动。"""
+    try:
+        cfg = load_cfg()
+    except Exception as e:
+        print(f"[X] 读不到 config.toml: {e}")
+        return 1
+    L = cfg.get("llama", {})
+    missing = []
+    exe = resolve_path(L.get("dir", "llama")) / "llama-server.exe"
+    if not exe.exists():
+        missing.append(f"llama-server.exe  ->  {exe}")
+    keys = ["asr_model", "asr_mmproj"]
+    if cfg.get("polish", {}).get("enabled", True):
+        keys.append("polish_model")
+    for k in keys:
+        p = resolve_path(L.get(k, ""))
+        if not p.exists():
+            missing.append(f"{k:<12}  ->  {p}")
+    if missing:
+        print("[X] 缺少运行文件：")
+        for m in missing:
+            print("    - " + m)
+        print("\n    一键下载: python voice_input.py --setup")
+        return 1
+    print("[OK] 环境就绪：llama.cpp + 模型都在。")
+    return 0
+
+
+def load_wav_16k(path: Path) -> np.ndarray:
+    with wave.open(str(path), "rb") as w:
+        sr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+        raw = w.readframes(w.getnframes())
+    if sw == 2:
+        a = np.frombuffer(raw, dtype=np.int16)
+    elif sw == 4:
+        a = (np.frombuffer(raw, dtype=np.int32) >> 16).astype(np.int16)
+    elif sw == 1:
+        a = ((np.frombuffer(raw, dtype=np.uint8).astype(np.int16) - 128) << 8)
+    else:
+        raise SystemExit(f"不支持的位深 {sw * 8}bit")
+    if ch > 1:
+        a = a.reshape(-1, ch).mean(axis=1).astype(np.int16)
+    if sr != 16000:
+        n = int(len(a) * 16000 / sr)
+        a = np.interp(np.arange(n) * (sr / 16000), np.arange(len(a)), a).astype(np.int16)
+    return a
+
+
+def test_wav(path: str, do_polish: bool = True) -> int:
+    p = Path(path)
+    if not p.is_absolute():
+        p = (Path.cwd() / p) if (Path.cwd() / p).exists() else (ROOT / p)
+    if not p.exists():
+        print(f"文件不存在: {p}")
+        return 2
+    cfg = load_cfg()
+    audio = load_wav_16k(p)
+    print(f"音频: {p.name}  {len(audio) / 16000:.2f}s\n")
+    t0 = time.time()
+    try:
+        raw = transcribe(to_wav(audio, 16000), cfg)
+    except urllib.error.URLError as e:
+        print(f"[ASR 连接失败] {e.reason}  先启动服务：VoiceInput.bat 或 python voice_input.py")
+        return 3
+    print(f"[ASR {time.time() - t0:.2f}s]\n{raw}\n")
+    if do_polish:
+        t1 = time.time()
+        try:
+            out = polish(raw, cfg)
+            print(f"[润色 {time.time() - t1:.2f}s]\n{out}")
+        except Exception as e:
+            print(f"[润色失败] {type(e).__name__}: {e}")
+    return 0
+
+
+def make_icon(path: str) -> int:
+    p = Path(path)
+    if not p.is_absolute():
+        p = ROOT / p
+    img = _icon_image((150, 200, 255), size=256)
+    img.save(p, format="ICO",
+             sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    print(f"已生成图标: {p}")
+    return 0
+
+
+def cli():
+    ap = argparse.ArgumentParser(
+        prog="voice_input.py",
+        description="本地离线语音输入（Qwen3-ASR + Qwen3.5，llama.cpp 本地推理）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("不带参数 = 启动语音输入。\n"
+                "  python voice_input.py --setup                  准备 llama.cpp + 模型\n"
+                "  python voice_input.py --setup --backend vulkan 换 Vulkan 后端\n"
+                "  python voice_input.py --test sample.wav        不用麦克风，测整条链路\n"),
+    )
+    ap.add_argument("--setup", action="store_true", help="一次性准备运行环境")
+    ap.add_argument("--backend", default="cuda", choices=["cuda", "vulkan", "cpu"],
+                    help="llama.cpp 后端（默认 cuda）")
+    ap.add_argument("--no-llama", action="store_true", help="--setup 时跳过 llama.cpp")
+    ap.add_argument("--no-models", action="store_true", help="--setup 时跳过模型下载")
+    ap.add_argument("--only", choices=["asr", "polish"], help="--setup 时只下其中一组模型")
+    ap.add_argument("--test", metavar="WAV", help="用 wav 文件测 ASR（不录音）")
+    ap.add_argument("--no-polish", action="store_true", help="--test 时跳过润色")
+    ap.add_argument("--make-icon", metavar="ICO", help="导出托盘图标为 .ico（打包用）")
+    ap.add_argument("--check", action="store_true", help="检查 llama.cpp / 模型是否就位")
+    ap.add_argument("--config", metavar="TOML", help="使用指定的配置文件")
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
+    _args = cli()
+    if _args.config:
+        os.environ["VOICE_INPUT_CONFIG"] = str(Path(_args.config).resolve())
+    if _args.make_icon:
+        sys.exit(make_icon(_args.make_icon))
+    if _args.check:
+        sys.exit(check_env())
+    if _args.setup:
+        if not ensure_deps():
+            sys.exit(1)
+        sys.exit(setup_all(_args))
+    if _args.test:
+        sys.exit(test_wav(_args.test, not _args.no_polish))
     main()
