@@ -2558,7 +2558,7 @@ class SkiaOverlay:
         path.lineTo(ccx + 6.6 * s, cy - 5.0 * s)
         pm = skia.PathMeasure(path, False)
         dst = skia.Path()
-        seg = _ease_out(min(1.0, max(0.0, (p - 0.06) / 0.30)))
+        seg = _ease_out(min(1.0, max(0.0, (p - 0.02) / 0.26)))
         pm.getSegment(0.0, pm.getLength() * seg, dst, True)
         ck = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
                         StrokeWidth=2.6 * s, Color=C(255, 255, 255, int(255 * progress)))
@@ -2679,7 +2679,7 @@ class SkiaOverlay:
                 fp = skia.Paint(AntiAlias=True)
                 fp.setShader(skia.GradientShader.MakeRadial(
                     skia.Point(px + pw * 0.82, cy), pw * 0.55,
-                    [C(*accent, int(70 * (1 - ft) ** 2)), C(*accent, 0)],
+                    [C(*accent, int(46 * (1 - ft) ** 2)), C(*accent, 0)],
                     [0.0, 1.0]))
                 self._canvas.save()
                 self._canvas.clipRRect(body, True)
