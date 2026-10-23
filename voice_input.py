@@ -346,6 +346,48 @@ def system_prompt(cfg: dict) -> str:
     return POLISH_SYSTEM + "\n附加规则：\n" + "\n".join(lines)
 
 
+_MATH_GLYPHS = "0-9A-Za-z\u0370-\u03ff\u00b2\u00b3\u00b9\u2070-\u209f\u221a\u221e"
+_MATH_OPS = "+-\u00d7\u00f7=\u2248\u2260\u2264\u2265\u00b1<>"
+_LATEX_MAP = {
+    r"\times": "\u00d7", r"\div": "\u00f7", r"\pm": "\u00b1",
+    r"\leq": "\u2264", r"\le": "\u2264", r"\geq": "\u2265", r"\ge": "\u2265",
+    r"\neq": "\u2260", r"\ne": "\u2260", r"\approx": "\u2248",
+    r"\infty": "\u221e", r"\sqrt": "\u221a",
+    r"\alpha": "\u03b1", r"\beta": "\u03b2", r"\gamma": "\u03b3",
+    r"\delta": "\u03b4", r"\theta": "\u03b8", r"\lambda": "\u03bb",
+    r"\mu": "\u03bc", r"\sigma": "\u03c3", r"\omega": "\u03c9", r"\pi": "\u03c0",
+}
+_SUP = str.maketrans("0123456789n", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207f")
+
+
+def tidy_math(text: str) -> str:
+    """清掉模型输出里的 $ / LaTeX 残留，并把公式排紧（纯排版，不改字）。"""
+    out = text.replace("$", "").replace("\\(", "").replace("\\)", "")
+    # 口语里的“派/圆周率”只有紧挨算式（约等于/等于/=）时才换成 π，避免误伤“派对”
+    out = re.sub(r"(?:圆周率|派)(?=\s*(?:≈|=|约等于|等于|的值|大约))", "π", out)
+    out = re.sub(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"\1/\2", out)
+    for k, v in _LATEX_MAP.items():
+        out = re.sub(re.escape(k) + r"(?![A-Za-z])", v, out)
+    out = re.sub(r"\\(?:text|mathrm|mathbf)\s*\{([^{}]*)\}", r"\1", out)
+    # 运算符两侧不留空格：α + β -> α+β，3 ≤ x -> 3≤x（连续运算符一次处理完）
+    ops = re.escape(_MATH_OPS)
+    out = re.sub(
+        rf"(?<=[{_MATH_GLYPHS})\u221a])\s*([{ops}])\s*(?=[{_MATH_GLYPHS}(\u221a])",
+        r"\1", out)
+    # x^2 -> x²，x^10 -> x¹⁰
+    def _sup(m):
+        e = m.group(1)
+        if e.startswith("-"):
+            return "\u207b" + e[1:].translate(_SUP)
+        return e.translate(_SUP)
+    out = re.sub(r"(?<=[0-9A-Za-z)])\^(-?(?:\d+|n))", _sup, out)
+    # 数字与单位之间不留空格：10 kΩ -> 10kΩ
+    out = re.sub(
+        r"(?<=\d)\s+(?=(?:k\u03a9|M\u03a9|\u03a9|\u03bcF|nF|pF|mA|\u03bcA|kV|V|mV|Hz|kHz|%))",
+        "", out)
+    return out
+
+
 def polish(text: str, cfg: dict) -> str:
     p = cfg["polish"]
     if not p.get("enabled", True):
@@ -367,6 +409,7 @@ def polish(text: str, cfg: dict) -> str:
     out = out.strip().strip("「」\"'“”")
     if not out:
         return text
+    out = tidy_math(out)
     # 防跑飞：长度离谱就直接用原文
     if len(out) > max(10, len(text) * p.get("max_ratio", 2.2)):
         print(f"[warn] 润色结果异常长，回退原文 ({len(out)} vs {len(text)})")
