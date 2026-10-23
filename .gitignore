@@ -1,0 +1,30 @@
+# ---- 大文件：模型不入库（用 python download_models.py 下载） ----
+models/
+llama.cpp/
+*.gguf
+*.part
+
+# ---- 运行时产物 ----
+*.log
+*.log.1
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 本地覆盖配置 ----
+config.local.toml
+*.local.toml
+
+# ---- 测试音频 / 截图（可能录到真人声音或桌面内容） ----
+*.wav
+*.mp3
+*.m4a
+*.png
+*.jpg
+!docs/*.png
+
+# ---- 系统垃圾 ----
+Thumbs.db
+desktop.ini
+.DS_Store

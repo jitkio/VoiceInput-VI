@@ -1,0 +1,60 @@
+# ============ 本地语音输入 / Local Voice Input · 配置 ============
+# 相对路径都相对于本文件所在目录（项目根目录）。
+
+[audio]
+samplerate = 16000
+device = ""        # 留空 = 系统默认麦克风；填设备名或索引可指定
+min_rms = 0.012    # 静音门限，环境吵就调大
+pad_ms = 200       # 掐掉首尾静音后两端各留多少毫秒
+max_seconds = 150  # 单次录音上限（秒）。实测模型硬上限约 4.2 分钟，留点余量
+
+[llama]
+# 由主程序自己启动/关闭模型服务：关窗口、Ctrl+C、甚至任务管理器强杀，
+# 后台的 llama-server 都会跟着一起死，不会残留。
+manage = true
+# llama.cpp 解压目录（相对项目根目录，也可写绝对路径）
+# 到 https://github.com/ggml-org/llama.cpp/releases 下载 Windows x64 (CUDA 12) 版
+dir = "llama.cpp"
+asr_model = "models/Qwen3-ASR-1.7B-Q8_0.gguf"        # 识别模型（LLM 部分）
+asr_mmproj = "models/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"  # 识别模型（音频编码器）
+polish_model = "models/Qwen3.5-4B-Q4_K_M.gguf"       # 润色模型
+ngl = 99      # 放到 GPU 的层数，显存紧张就调小；纯 CPU 设 0
+threads = 8
+
+[asr]
+# llama.cpp 的 Qwen3-ASR 服务（:8081）
+url = "http://127.0.0.1:8081/v1/chat/completions"
+timeout = 90
+language = ""      # 留空 = 自动识别；可填 "Chinese" / "English"
+
+[polish]
+# 第二级润色：加标点 / 去口水词 / 修同音错字
+enabled = true
+url = "http://127.0.0.1:8082/v1/chat/completions"
+timeout = 40
+temperature = 0.2
+max_ratio = 2.2    # 润色结果长度超过原文这个倍数就丢弃，用原文（防跑飞）
+
+# 额外规则：想要更强的改写就取消注释，每条都会略微变慢、也更容易改多。
+extra_rules = [
+  # "数字、金额、百分比、日期一律写成阿拉伯数字：三十二万四千元 -> 32.4 万元；百分之十七点三 -> 17.3%",
+  # "说话人自己纠错时（不对 / 我是说 / 改成），只保留最终结论，删掉纠错过程",
+]
+
+[ui]
+# 悬浮胶囊外观（逻辑像素，自动按屏幕缩放）
+width = 360          # 宽度（320 更精致，460 更醒目）
+height = 80          # 高度（圆角半径 = 高度/2）
+style = "bars"       # 仅旧版 Pillow 渲染器使用；Skia 版固定画细竖条
+bottom_margin = 92   # 离屏幕底部距离
+glass = true         # 毛玻璃：截取身后桌面做真高斯模糊
+tint = 90            # 磨砂白度 0-255：越大越不透明、字越清楚；越小越透、越能看到桌面
+                     # （背景暗时会自动加白，保证永远是"亮玻璃 + 深色内容"）
+
+[hotkey]
+# 按住说话的热键：caps_lock / scroll_lock / pause / f9
+key = "caps_lock"
+
+[output]
+paste = true       # true=自动粘贴到光标处；false=只复制到剪贴板
+restore_clipboard = true   # 粘贴后恢复你原来剪贴板里的内容

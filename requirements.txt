@@ -1,0 +1,13 @@
+# Voice Input - Python dependencies (Windows 10/11, Python 3.11+)
+
+numpy>=1.26
+sounddevice>=0.4.6
+pyperclip>=1.8.2
+pynput>=1.7.6
+
+# 悬浮胶囊渲染：Pillow 是兜底，skia-python 是主渲染器
+Pillow>=10.0
+skia-python>=87.0
+
+# 系统托盘（没装也能跑，只是没有托盘菜单）
+pystray>=0.19.5
