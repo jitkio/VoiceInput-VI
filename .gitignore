@@ -37,3 +37,6 @@ config.local.toml
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# 构建用虚拟环境
+.venv_build/

@@ -1812,6 +1812,36 @@ SK_ACCENTS = {
     "error": (255, 159, 28),
 }
 
+# 波形：深蓝 -> 浅青蓝
+SK_BAR_LEFT = (28, 90, 255)
+SK_BAR_RIGHT = (104, 206, 255)
+
+
+# ---------------------------------------------------------------- 动画辅助
+
+
+def _clamp01(x):
+    return 0.0 if x < 0 else (1.0 if x > 1 else x)
+
+
+def _ease_out(t):
+    t = _clamp01(t)
+    return 1.0 - (1.0 - t) ** 3
+
+
+def _ease_out_back(t):
+    """先冲过头一点再回弹（spring 感）。"""
+    t = _clamp01(t)
+    c1 = 1.62
+    return 1.0 + (c1 + 1.0) * (t - 1.0) ** 3 + c1 * (t - 1.0) ** 2
+
+
+def _mixc(c1, c2, t):
+    t = _clamp01(t)
+    return (c1[0] + (c2[0] - c1[0]) * t,
+            c1[1] + (c2[1] - c1[1]) * t,
+            c1[2] + (c2[2] - c1[2]) * t)
+
 FONT_BOLD = r"C:\Windows\Fonts\msyhbd.ttc"
 FONT_REG = r"C:\Windows\Fonts\msyh.ttc"
 
@@ -1856,13 +1886,13 @@ class Design:
     pad = 34.0              # 窗口留白（给投影/发光）
 
     # 内容布局（相对胶囊左边界）
-    dot_x = 34.0
-    dot_r = 3.4
-    bars_x0 = 56.0
-    bars_right_pad = 92.0   # 右侧给黑圆留出的宽度
-    bars_n = 26
-    bar_w = 2.4
-    bar_max_h = 28.0        # 波形最大高度（胶囊高的 ~37%）
+    dot_x = 30.0
+    dot_r = 3.6
+    bars_x0 = 54.0
+    bars_right_pad = 96.0   # 右侧给黑圆留出的宽度
+    bars_n = 32
+    bar_w = 2.6
+    bar_max_h = 30.0        # 波形最大高度（胶囊高的 ~39%）
 
     circle_r = 23.0
     circle_right_pad = 8.0
@@ -1932,9 +1962,20 @@ class SkiaOverlay:
 
         self._tf_bold = _typeface(FONT_BOLD)
         self._tf_reg = _typeface(FONT_REG)
-        self._font_btn = skia.Font(self._tf_bold, 14.0 * s * self.SS)
-        self._font_msg = skia.Font(self._tf_reg, 17.0 * s * self.SS)
+        self._font_btn = skia.Font(self._tf_bold, 14.5 * s * self.SS)
+        self._font_msg = skia.Font(self._tf_reg, 16.5 * s * self.SS)
         self._paint_cache = {}
+
+        # 动画状态
+        self._canvas = None
+        self._bars_v = [0.0] * int(self.d.bars_n)
+        self._last_t = 0.0
+        self._shown_t = 0.0
+        self._appear = 1.0
+        self._accent_now = SK_ACCENTS["recording"]
+        self._accent_prev = SK_ACCENTS["recording"]
+        self._img_cache = {}
+        self._bar_shader = None
 
     # -------------------------------------------------- 对外
     def start(self, timeout: float = 6.0) -> bool:
@@ -2046,6 +2087,9 @@ class SkiaOverlay:
         self._visible = False
         self._blit_fail = 0
         self._gfx_dirty = False
+        self._img_cache = {}
+        self._bar_shader = None
+        self._bar_shader = None
 
     def _recreate_window(self):
         """窗口句柄都没了（会话切换/桌面重建）时整个重来。"""
@@ -2103,9 +2147,15 @@ class SkiaOverlay:
         try:
             while True:
                 state, text = self._q.get_nowait()
+                prev = self._state
+                self._accent_prev = self._accent_now
                 self._state = state
                 self._text = text
                 self._state_t = now
+                if prev == "idle" or state == "recording":
+                    self._shown_t = now
+                    self._last_t = now
+                    self._appear = 0.0
         except queue.Empty:
             pass
 
@@ -2124,6 +2174,11 @@ class SkiaOverlay:
                 self._visible = False
                 self._glass_img = None
                 self._static = None
+            # 完全隐藏后重置动画，下次出现从头播
+            self._shown_t = 0.0
+            self._last_t = 0.0
+            if any(self._bars_v):
+                self._bars_v = [0.0] * len(self._bars_v)
             return
 
         if not self._visible:
@@ -2198,6 +2253,71 @@ class SkiaOverlay:
              C(255, 255, 255, int(255 * self._wl[2]))],
             [0.0, 0.55, 1.0]))
         return p
+
+    def _glow_image(self, accent):
+        """低分辨率柔光图（按颜色缓存）。每帧只贴一次图，不逐帧建渐变。"""
+        key = ("glow", int(accent[0]) // 12, int(accent[1]) // 12, int(accent[2]) // 12)
+        img = self._img_cache.get(key)
+        if img is not None:
+            return img
+        gw, gh = max(16, self.W // 6), max(16, self.H // 6)
+        surf = skia.Surface(gw, gh)
+        c = surf.getCanvas()
+        c.clear(skia.ColorTRANSPARENT)
+        sx, sy = gw / self.W, gh / self.H
+        p = skia.Paint(AntiAlias=True)
+        p.setShader(skia.GradientShader.MakeRadial(
+            skia.Point((self.pad + self.pw / 2) * sx, (self.pad + self.ph / 2) * sy),
+            self.pw * 0.62 * sx,
+            [C(*accent, 255), C(*accent, 120), C(*accent, 0)],
+            [0.0, 0.50, 1.0]))
+        c.drawRect(skia.Rect.MakeWH(gw, gh), p)
+        img = surf.makeImageSnapshot()
+        if len(self._img_cache) > 40:
+            self._img_cache.clear()
+        self._img_cache[key] = img
+        return img
+
+    def _sweep_image(self):
+        """预渲染扫光带（白色横向渐变），每帧只旋转贴图。"""
+        img = self._img_cache.get("sweep")
+        if img is not None:
+            return img
+        bw_, bh_ = 96, 48
+        surf = skia.Surface(bw_, bh_)
+        c = surf.getCanvas()
+        c.clear(skia.ColorTRANSPARENT)
+        p = skia.Paint(AntiAlias=True)
+        p.setShader(skia.GradientShader.MakeLinear(
+            [skia.Point(0, 0), skia.Point(bw_, 0)],
+            [C(255, 255, 255, 0), C(255, 255, 255, 255), C(255, 255, 255, 0)],
+            [0.0, 0.5, 1.0]))
+        c.drawRect(skia.Rect.MakeWH(bw_, bh_), p)
+        img = surf.makeImageSnapshot()
+        self._img_cache["sweep"] = img
+        return img
+
+    def _spinner_image(self):
+        """预渲染彗尾圆弧（白色），每帧只旋转贴图。"""
+        img = self._img_cache.get("spinner")
+        if img is not None:
+            return img
+        d = 96
+        surf = skia.Surface(d, d)
+        c = surf.getCanvas()
+        c.clear(skia.ColorTRANSPARENT)
+        p = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=6)
+        p.setShader(skia.GradientShader.MakeSweep(
+            d / 2, d / 2,
+            [C(255, 255, 255, 0), C(255, 255, 255, 110),
+             C(255, 255, 255, 205), C(255, 255, 255, 255)],
+            [0.0, 0.40, 0.82, 1.0], startAngle=0, endAngle=360))
+        p.setStrokeCap(skia.Paint.kRound_Cap)
+        m_ = 8
+        c.drawArc(skia.Rect.MakeXYWH(m_, m_, d - 2 * m_, d - 2 * m_), 0, 250, False, p)
+        img = surf.makeImageSnapshot()
+        self._img_cache["spinner"] = img
+        return img
 
     # -------------------------------------------------- 静态层（投影 + 玻璃 + 边）
     def _build_static(self):
@@ -2277,6 +2397,220 @@ class SkiaOverlay:
         return surf.makeImageSnapshot()
 
     # -------------------------------------------------- 每帧渲染（只画内容）
+    def _motion(self, now: float, dt: float):
+        """推进所有随时间变化的量：出现动画、颜色过渡、波形平滑。"""
+        if not self._shown_t:
+            self._shown_t = now
+        self._appear = min(1.0, max(0.0, (now - self._shown_t) / 0.55))
+
+        # 状态色平滑过渡（避免红/蓝/绿硬切）
+        st = self._state if self._state in SK_ACCENTS else "recording"
+        mix = min(1.0, (now - self._state_t) / 0.30)
+        self._accent_now = _mixc(self._accent_prev, SK_ACCENTS[st], _ease_out(mix))
+
+        # 波形：32 根，起音快、回落慢；两种状态共用同一个缓冲，切换时自然过渡
+        n = len(self._bars_v)
+        k = min(2.0, dt * 50.0)
+        if st == "recording":
+            levels = self.meter.snapshot()
+            m = len(levels)
+            for i in range(n):
+                if m:
+                    src = levels[min(m - 1, int(round(i * (m - 1) / max(1, n - 1))))]
+                else:
+                    src = 0.0
+                t = i / max(1, n - 1)
+                env = 0.62 + 0.46 * math.sin(math.pi * t) ** 0.7
+                target = min(1.0, src * env)
+                v = self._bars_v[i]
+                v += (target - v) * min(1.0, (0.62 if target > v else 0.16) * k)
+                self._bars_v[i] = v
+        elif st == "busy":
+            for i in range(n):
+                t = i / max(1, n - 1)
+                w1 = 0.5 + 0.5 * math.sin(i * 0.62 - now * 6.2)
+                w2 = 0.5 + 0.5 * math.sin(i * 0.23 + now * 2.4)
+                target = 0.16 + 0.44 * (0.78 * w1 + 0.22 * w2) * (0.50 + 0.50 * math.sin(math.pi * t))
+                v = self._bars_v[i]
+                v += (target - v) * min(1.0, 0.20 * k)
+                self._bars_v[i] = v
+        else:                                    # done / error：波形退场
+            for i in range(n):
+                self._bars_v[i] *= max(0.0, 1.0 - 0.22 * k)
+
+    def _lerp_bars(self, x0, x1, cy, s, progress):
+        """条形波形：深蓝渐变 + 底部微光。"""
+        n = len(self._bars_v)
+        if n < 2:
+            return
+        pitch = (x1 - x0) / n
+        bw = max(2.2 * s, min(pitch * 0.42, self.d.bar_w * 1.15 * s))
+        max_h = self.d.bar_max_h * s
+        peak = max(self._bars_v) if self._bars_v else 0.0
+        base_a = int(135 * max(0.0, 1.0 - peak / 0.14) * progress)
+        if base_a > 0 and self._state in ("recording", "busy"):
+            self._canvas.drawRRect(
+                self._rr(x0, cy - 1.1 * s, x1 - x0, 2.2 * s, 1.1 * s),
+                skia.Paint(AntiAlias=True, Color=C(96, 150, 235, base_a)))
+
+        # 一条 Path 装下所有柱子 + 倒影：2 次绘制而不是 64 次
+        path = skia.Path()
+        mirror = skia.Path()
+        for i, v in enumerate(self._bars_v):
+            v = v * progress
+            if v <= 0.045:
+                continue
+            cx = x0 + (i + 0.5) * pitch
+            h = max(2.4 * s, v * max_h)
+            path.addRRect(self._rr(cx - bw / 2, cy - h / 2, bw, h, bw / 2))
+            rh = h * 0.26
+            mirror.addRRect(self._rr(cx - bw / 2, cy + h / 2 + 2.0 * s, bw, rh, bw / 2))
+
+        if self._bar_shader is None:
+            self._bar_shader = skia.GradientShader.MakeLinear(
+                [skia.Point(x0, 0), skia.Point(x1, 0)],
+                [C(*SK_BAR_LEFT, 235), C(*SK_BAR_RIGHT, 235)],
+                [0.0, 1.0])
+        paint = skia.Paint(AntiAlias=True)
+        paint.setShader(self._bar_shader)
+        self._canvas.drawPath(path, paint)
+
+        mp = skia.Paint(AntiAlias=True, Color=C(*SK_BAR_RIGHT, 16))
+        self._canvas.drawPath(mirror, mp)
+
+    def _draw_dot(self, cx, cy, s, now, accent, progress):
+        """录音指示点：实心红点 + 双层扩散光晕，随说话音量微微放大。"""
+        lvl = self._bars_v[-4] if len(self._bars_v) >= 4 else 0.0
+        base = self.d.dot_r * s * (1.0 + 0.55 * min(1.0, lvl * 1.8))
+        self._canvas.drawCircle(
+            cx, cy, base * (1.0 + 0.06 * math.sin(now * 5.2)),
+            skia.Paint(AntiAlias=True, Color=C(*accent, int(255 * progress))))
+        for k in (0.0, 0.5):
+            ph = ((now * 0.78) + k) % 1.0
+            r = base * (1.5 + 3.4 * ph)
+            a = int(110 * (1.0 - ph) ** 2 * progress)
+            if a <= 0:
+                continue
+            ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                              StrokeWidth=1.5 * s, Color=C(*accent, a))
+            self._canvas.drawCircle(cx, cy, r, ring)
+        self._canvas.drawCircle(cx - base * 0.30, cy - base * 0.34, base * 0.32,
+                                skia.Paint(AntiAlias=True, Color=C(255, 255, 255, int(120 * progress))))
+
+    def _draw_sweep(self, body, px, py, pw, ph, s, now, progress):
+        """玻璃上滑过的高光带（出现时扫一次，监听时每 3.6 秒扫一次）。"""
+        t = (now - self._shown_t)
+        if t < 0:
+            return
+        cycle = 3.6 if self._state == "recording" else 1e9
+        p = (t % cycle) / 0.95
+        if p > 1.0:
+            return
+        x = px - pw * 0.35 + p * pw * 1.7
+        w = pw * 0.38
+        img = self._sweep_image()
+        band = skia.Paint(AntiAlias=True)
+        band.setAlphaf(0.22 * progress)
+        self._canvas.save()
+        self._canvas.clipRRect(body, True)
+        self._canvas.rotate(-16, px + pw / 2, py + ph / 2)
+        self._canvas.drawImageRect(img, skia.Rect.MakeWH(img.width(), img.height()),
+                                   skia.Rect.MakeXYWH(x, py - ph * 0.6, w, ph * 2.2),
+                                   skia.SamplingOptions(skia.FilterMode.kLinear), band)
+        self._canvas.restore()
+
+    def _draw_spinner(self, ccx, cy, cr, s, now, accent, progress):
+        """识别中：锥形渐变彗尾 + 头部光点，呼吸式半径。"""
+        spin = (now * 430.0) % 360.0
+        r = cr * (0.44 + 0.025 * math.sin(now * 3.4))
+        img = self._spinner_image()
+        size = r * 2 * 1.85
+        p = skia.Paint(AntiAlias=True)
+        p.setAlphaf(min(1.0, 1.05 * progress))
+        self._canvas.save()
+        self._canvas.rotate(spin + 250, ccx, cy)
+        self._canvas.drawImageRect(img, skia.Rect.MakeWH(img.width(), img.height()),
+                                   skia.Rect.MakeXYWH(ccx - size / 2, cy - size / 2,
+                                                      size, size),
+                                   skia.SamplingOptions(skia.FilterMode.kLinear), p)
+        self._canvas.restore()
+        # 头部光点
+        a = math.radians(spin + 250)
+        hx, hy = ccx + r * math.cos(a), cy + r * math.sin(a)
+        self._canvas.drawCircle(hx, hy, 1.9 * s,
+                                skia.Paint(AntiAlias=True, Color=C(255, 255, 255, int(245 * progress))))
+        self._canvas.drawCircle(hx, hy, 4.2 * s,
+                                skia.Paint(AntiAlias=True, Color=C(*accent, int(45 * progress))))
+        # 外圈三颗缓慢环绕的小点
+        for i in range(3):
+            ang = math.radians(spin * 0.35 + i * 120)
+            r2 = cr * 0.72
+            self._canvas.drawCircle(
+                ccx + r2 * math.cos(ang), cy + r2 * math.sin(ang), 1.5 * s,
+                skia.Paint(AntiAlias=True,
+                           Color=C(*accent, int((70 + 40 * i) * progress))))
+
+    def _draw_check(self, ccx, cy, cr, s, p, progress):
+        """完成：对勾用路径逐段画出 + 圆环扩散 + 小火花。"""
+        path = skia.Path()
+        path.moveTo(ccx - 6.6 * s, cy + 0.6 * s)
+        path.lineTo(ccx - 2.0 * s, cy + 5.0 * s)
+        path.lineTo(ccx + 6.6 * s, cy - 5.0 * s)
+        pm = skia.PathMeasure(path, False)
+        dst = skia.Path()
+        seg = _ease_out(min(1.0, max(0.0, (p - 0.06) / 0.30)))
+        pm.getSegment(0.0, pm.getLength() * seg, dst, True)
+        ck = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                        StrokeWidth=2.6 * s, Color=C(255, 255, 255, int(255 * progress)))
+        ck.setStrokeCap(skia.Paint.kRound_Cap)
+        ck.setStrokeJoin(skia.Paint.kRound_Join)
+        self._canvas.drawPath(dst, ck)
+
+        # 圆环扩散
+        if p < 0.9:
+            q = p / 0.9
+            rr = cr + 34 * self.s * _ease_out(q)
+            ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                              StrokeWidth=2.0 * self.s * (1.0 - 0.6 * q),
+                              Color=C(*SK_ACCENTS["done"], int(120 * (1 - q) ** 1.6 * progress)))
+            self._canvas.drawCircle(ccx, cy, rr, ring)
+
+        # 六颗小火花
+        if p < 0.75:
+            q = p / 0.75
+            for i in range(6):
+                ang = math.radians(-150 + i * 60 + (i % 2) * 12)
+                dist = cr * 1.15 + 30 * self.s * _ease_out(q) * (0.7 + 0.3 * (i % 3) / 2)
+                sx = ccx + dist * math.cos(ang)
+                sy = cy + dist * math.sin(ang) + 6 * self.s * q * q
+                a = int(210 * (1 - q) ** 1.4 * progress)
+                if a > 0:
+                    self._canvas.drawCircle(
+                        sx, sy, (2.1 - 1.2 * q) * self.s,
+                        skia.Paint(AntiAlias=True,
+                                   Color=C(*SK_ACCENTS["done"], a)))
+
+    def _draw_bang(self, ccx, cy, s, now, progress):
+        """出错：感叹号弹跳进入。"""
+        t = min(1.0, (now - self._state_t) / 0.32)
+        k = 1.0 + 0.55 * (1.0 - _ease_out(t)) * math.cos(t * 9.0)
+        bomp = skia.Paint(AntiAlias=True, Color=C(255, 255, 255, int(250 * progress)))
+        self._canvas.save()
+        self._canvas.translate(ccx, cy)
+        self._canvas.scale(k, k)
+        self._canvas.translate(-ccx, -cy)
+        self._canvas.drawRRect(self._rr(ccx - 1.5 * s, cy - 8.5 * s, 3.0 * s, 11.0 * s, 1.5 * s), bomp)
+        self._canvas.drawCircle(ccx, cy + 6.4 * s, 1.6 * s, bomp)
+        self._canvas.restore()
+
+    def _bar_progress(self, now):
+        """波形整体出现/退场进度。"""
+        if self._state == "recording":
+            return min(1.0, (now - self._state_t) / 0.22)
+        if self._state == "busy":
+            return 1.0
+        return 1.0
+
     def _render(self, now: float):
         ss = self.SS
         s = self.s * ss
@@ -2284,83 +2618,149 @@ class SkiaOverlay:
         if self._static is None:
             self._static = self._build_static()
 
+        dt = max(0.004, min(0.05, now - self._last_t)) if self._last_t else 0.02
+        self._last_t = now
+        self._motion(now, dt)
+
         surf = skia.Surface(W, H)
         c = surf.getCanvas()
+        self._canvas = c
         c.clear(skia.ColorTRANSPARENT)
-        c.drawImage(self._static, 0, 0)
 
         px, py = self.pad * ss, self.pad * ss
         pw, ph = self.pw * ss, self.ph * ss
         radius = self.d.radius * s
         body = self._rr(px, py, pw, ph, radius)
+        cx0, cy0 = px + pw / 2, py + ph / 2
         cy = py + ph / 2
 
-        accent = SK_ACCENTS.get(self._state, SK_ACCENTS["recording"])
-        ink = C(26, 26, 30, 255)
+        st = self._state if self._state in SK_ACCENTS else "recording"
+        accent = self._accent_now
 
-        levels = self.meter.snapshot() if self._state == "recording" else []
-        lv = levels[-1] if levels else 0.0
-        self._smooth += (lv - self._smooth) * 0.3
+        # ---- 出现动画：缩放 + 上浮 + 轻微回弹
+        appear = _ease_out_back(self._appear) if self._appear < 1 else 1.0
+        k = 0.90 + 0.10 * appear
+        dy = 13.0 * (1.0 - _ease_out(self._appear)) * self.s
+        shake = 0.0
+        if st == "error":
+            t = now - self._state_t
+            shake = 7.0 * math.sin(t * 33.0) * math.exp(-t * 7.0) * self.s
 
-        dr = self.d.dot_r * s * (1.0 + (0.08 * math.sin(now * 4.6)
-                                        if self._state == "recording" else 0.0))
-        dx = px + self.d.dot_x * s
-        c.drawCircle(dx, cy, dr, skia.Paint(AntiAlias=True, Color=C(*accent, 255)))
-        c.drawCircle(dx - dr * 0.30, cy - dr * 0.34, dr * 0.30,
-                     skia.Paint(AntiAlias=True, Color=C(255, 255, 255, 115)))
+        c.save()
+        c.translate(shake, dy)
+        c.translate(cx0, cy0)
+        c.scale(k, k)
+        c.translate(-cx0, -cy0)
 
-        heights = self._heights(levels, now)
-        if heights:
-            c.save()
-            c.clipRRect(body, True)
-            x0 = px + self.d.bars_x0 * s
-            x1 = px + pw - self.d.bars_right_pad * s
-            self._draw_bars(c, heights, x0, x1, cy, s, ink, accent)
-            c.restore()
+        # ---- 状态色光晕（在玻璃后面，透出来）
+        glow_a = 0.0
+        if st == "recording":
+            glow_a = 0.10 + 0.03 * math.sin(now * 2.2)
+        elif st == "busy":
+            glow_a = 0.12 + 0.04 * math.sin(now * 3.6)
+        elif st == "done":
+            glow_a = 0.14 * max(0.0, 1.0 - (now - self._state_t) / 0.9)
+        elif st == "error":
+            glow_a = 0.10
+        if glow_a > 0.002:
+            gi = self._glow_image(accent)
+            gp = skia.Paint(AntiAlias=True)
+            gp.setAlphaf(min(1.0, glow_a))
+            c.drawImageRect(gi, skia.Rect.MakeWH(gi.width(), gi.height()),
+                            skia.Rect.MakeXYWH(px - 18 * s, py - 14 * s,
+                                               pw + 36 * s, ph + 32 * s),
+                            skia.SamplingOptions(skia.FilterMode.kLinear), gp)
 
+        c.drawImage(self._static, 0, 0)
+
+        if st == "done":
+            ft = (now - self._state_t) / 0.45
+            if ft < 1.0:
+                fp = skia.Paint(AntiAlias=True)
+                fp.setShader(skia.GradientShader.MakeRadial(
+                    skia.Point(px + pw * 0.82, cy), pw * 0.55,
+                    [C(*accent, int(70 * (1 - ft) ** 2)), C(*accent, 0)],
+                    [0.0, 1.0]))
+                self._canvas.save()
+                self._canvas.clipRRect(body, True)
+                self._canvas.drawRect(skia.Rect.MakeXYWH(px, py, pw, ph), fp)
+                self._canvas.restore()
+
+        # ---- 状态色内描边（把红/蓝/绿“贴”到胶囊边缘）
+        rim = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                         StrokeWidth=1.4 * s, Color=C(*accent, 34))
+        c.drawRRect(body, rim)
+
+        # ---- 玻璃内：扫光 + 波形 + 红点
+        progress = self._bar_progress(now)
+        self._draw_sweep(body, px, py, pw, ph, s, now, self._alpha if self._alpha > 0 else 1.0)
+
+        c.save()
+        c.clipRRect(body, True)
+        x0 = px + self.d.bars_x0 * s
+        x1 = px + pw - self.d.bars_right_pad * s
+        self._lerp_bars(x0, x1, cy, s, progress)
+        c.restore()
+
+        dot_cx = px + self.d.dot_x * s
+        self._draw_dot(dot_cx, cy, s, now, accent, 1.0)
+
+        # ---- 右侧圆形按钮
         cr = self.d.circle_r * s
         ccx = px + pw - (self.d.circle_right_pad * s + cr)
-        c.drawCircle(ccx, cy, cr, skia.Paint(AntiAlias=True, Color=C(16, 16, 18, 255)))
+        pop = 1.0
+        if st == "done":
+            t = now - self._state_t
+            pop = 1.0 + 0.11 * math.exp(-8.0 * t) * math.cos(16.0 * t)
+        c.save()
+        c.translate(ccx, cy)
+        c.scale(pop, pop)
+        c.translate(-ccx, -cy)
+
+        bt = skia.Paint(AntiAlias=True, Color=C(16, 16, 18, 250))
+        c.drawCircle(ccx, cy, cr, bt)
         ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
-                          StrokeWidth=1.2 * s)
+                          StrokeWidth=1.3 * s)
         ring.setShader(skia.GradientShader.MakeLinear(
             [skia.Point(ccx - cr, cy - cr), skia.Point(ccx + cr, cy + cr)],
-            [C(255, 255, 255, 55), C(255, 255, 255, 0)]))
-        c.drawCircle(ccx, cy, cr - 0.8 * s, ring)
+            [C(*accent, 110), C(*accent, 0)]))
+        c.drawCircle(ccx, cy, cr - 0.9 * s, ring)
 
-        if self._state == "recording":
+        if st == "recording":
             el = now - self._state_t
+            frac = (el % 1.0)
+            kk = 1.0 + 0.055 * math.exp(-9.0 * frac)
+            c.save()
+            c.translate(ccx, cy)
+            c.scale(kk, kk)
+            c.translate(-ccx, -cy)
             self._center_text(c, "%d:%02d" % (int(el // 60), int(el % 60)),
                               ccx, cy, self._font_btn, C(255, 255, 255, 250))
-        elif self._state == "busy":
-            ar = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
-                            StrokeWidth=2.2 * s, Color=C(255, 255, 255, 235))
-            ar.setStrokeCap(skia.Paint.kRound_Cap)
-            a0 = (now * 400) % 360
-            r = cr * 0.42
-            c.drawArc(skia.Rect.MakeXYWH(ccx - r, cy - r, r * 2, r * 2),
-                      a0, 265, False, ar)
-        elif self._state == "done":
-            ck = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
-                            StrokeWidth=2.4 * s, Color=C(255, 255, 255, 255))
-            ck.setStrokeCap(skia.Paint.kRound_Cap)
-            ck.setStrokeJoin(skia.Paint.kRound_Join)
-            path = skia.Path()
-            path.moveTo(ccx - 6.2 * s, cy + 0.4 * s)
-            path.lineTo(ccx - 1.8 * s, cy + 4.6 * s)
-            path.lineTo(ccx + 6.2 * s, cy - 4.8 * s)
-            c.drawPath(path, ck)
+            c.restore()
+        elif st == "busy":
+            self._draw_spinner(ccx, cy, cr, s, now, accent, 1.0)
+        elif st == "done":
+            t = now - self._state_t
+            self._draw_check(ccx, cy, cr, s, t, 1.0)
         else:
-            self._center_text(c, "!", ccx, cy, self._font_btn, C(255, 255, 255, 250))
+            self._draw_bang(ccx, cy, s, now, 1.0)
+        c.restore()
 
-        if self._state in ("done", "error"):
-            msg = "已上屏" if self._state == "done" else (self._text or "出错了")
-            painter_cx = (px + self.d.dot_x * s + ccx - cr) / 2
+        # ---- 文字（完成 / 出错）
+        if st in ("done", "error"):
+            t = now - self._state_t
+            msg = "已上屏" if st == "done" else (self._text or "出错了")
+            ap = min(1.0, max(0.0, (t - 0.10) / 0.26))
+            txt_cx = (px + self.d.dot_x * s + ccx - cr) / 2
             f = self._font_msg
-            while f.measureText(msg) > (ccx - cr - (px + self.d.dot_x * s) - 40 * s) and msg:
+            limit = (ccx - cr - (px + self.d.dot_x * s) - 34 * s)
+            while msg and f.measureText(msg) > limit:
                 msg = msg[:-1]
             if msg:
-                self._center_text(c, msg, painter_cx, cy, f, ink)
+                self._center_text(c, msg, txt_cx + (1.0 - ap) * 10 * s, cy, f,
+                                  C(26, 26, 30, int(255 * ap)))
+
+        c.restore()
 
         img = surf.makeImageSnapshot()
         if ss > 1:
@@ -2374,38 +2774,6 @@ class SkiaOverlay:
                              skia.Paint())
             img = small.makeImageSnapshot()
         return img
-
-    def _heights(self, levels, now):
-        n = self.d.bars_n
-        if self._state == "recording" and levels:
-            seq = ([0.0] * n + levels)[-n:]
-            seq = [v * (0.8 + 0.2 * (i / (n - 1))) for i, v in enumerate(seq)]
-            sm = []
-            for i in range(len(seq)):
-                a = seq[max(0, i - 1)]
-                b = seq[min(len(seq) - 1, i + 1)]
-                sm.append(0.25 * a + 0.5 * seq[i] + 0.25 * b)
-            return sm
-        if self._state == "busy":
-            return [0.16 + 0.30 * (0.5 + 0.5 * math.sin(i * 0.62 - now * 5.2))
-                    for i in range(n)]
-        return []
-
-    def _draw_bars(self, c, heights, x0, x1, cy, s, ink, accent):
-        n = len(heights)
-        if n < 2:
-            return
-        pitch = (x1 - x0) / n
-        bw = max(1.8 * s, self.d.bar_w * s)
-        max_h = self.d.bar_max_h * s
-        for i, v in enumerate(heights):
-            cx = x0 + (i + 0.5) * pitch
-            h = max(2.2 * s, v * max_h)
-            t = i / max(1, n - 1)
-            col = C(int(26 + accent[0] * 0.08), int(26 + accent[1] * 0.08),
-                    int(30 + accent[2] * 0.08), int(150 + 105 * (t ** 0.6)))
-            c.drawRRect(self._rr(cx - bw / 2, cy - h / 2, bw, h, bw / 2),
-                        skia.Paint(AntiAlias=True, Color=col))
 
     def _center_text(self, c, text, cx, cy, font, color):
         w = font.measureText(text)

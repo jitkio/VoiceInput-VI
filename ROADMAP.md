@@ -11,7 +11,8 @@
 - [x] 托盘：暂停 / 开机自启 / 配置 / 日志 / 退出
 - [x] 单实例锁、粘贴后剪贴板还原、润色失败回退原文
 - [x] 代码合并成单文件；`--setup` 自动下载 llama.cpp + 模型；`--check` 自检
-- [x] PyInstaller 打包脚本（`build_exe.bat`）
+- [x] PyInstaller 打包脚本（`build_exe.bat`，固定 6.11.1，含 Skia）
+- [x] 悬浮胶囊动画重做（出现回弹 / 波形倒影 / 彗尾转圈 / 对勾描边 / 火花 / 出错抖动）
 
 ## Step 1 · 图形设置界面（约 6–8 小时）
 
@@ -53,6 +54,6 @@
 
 | 项 | 说明 |
 |---|---|
-| exe 版没有 Skia | skia + pynput 在 PyInstaller 里原生冲突（进程崩溃），打包时排除，改用 Pillow 渲染 |
+| PyInstaller 版本敏感 | 只有 6.11.x 打包 skia 不崩（6.22 会段错误），`build_exe.bat` 里已固定 |
 | 模型不支持热切换 | 改 `config.toml` 后需要重启程序 |
 | 只有 Windows | 悬浮窗 / 热键抑制 / 托盘 / 开机自启全是 Win32 实现 |

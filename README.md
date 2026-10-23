@@ -62,8 +62,8 @@ build_exe.bat
 产出 `dist\VoiceInput\VoiceInput.exe`（约 164 MB，PyInstaller onedir）。把 `dist\VoiceInput\` 整个文件夹拷走就能用；
 里面的 `models\`、`llama\` 是空的，要么把文件放进去，要么在该目录执行 `VoiceInput.exe --setup` 自动下。
 
-> exe 版**故意不打包 skia**（skia 与 pynput 在 PyInstaller 里会原生冲突崩溃），悬浮条改用 Pillow 渲染，画质略降但稳定。
-> 直接跑 `python voice_input.py` 的版本用 Skia 渲染，边缘更细腻。
+构建脚本会自动建一个隔离环境 `.venv_build`，并固定 `pyinstaller==6.11.1` —— 更新的 PyInstaller 打包 skia 会原生崩溃。
+exe 版和脚本版**用同一套 Skia 渲染**，动画完全一致。产物约 230 MB（含 numpy / skia 运行库），首次构建 3–5 分钟。
 
 ---
 
@@ -183,6 +183,21 @@ python voice_input.py --config my.toml    # 用别的配置文件
 | `output.paste` | `true` | 自动 Ctrl+V；`false` 只写剪贴板 |
 | `output.restore_clipboard` | `true` | 粘贴 0.6 秒后还原原剪贴板内容 |
 
+## 界面动画
+
+悬浮胶囊有四种状态，每次切换都是连续动画，不是硬切：
+
+| 状态 | 动画 |
+|---|---|
+| 出现 | 0.55 s：缩放 0.90 → 1.00 带回弹、上浮 13 px、颜色由上一状态过渡；同时玻璃上扫过一道高光 |
+| 录音中 | 红点随音量微放大 + 双层扩散光圈；32 根深蓝波形柱（起音快/回落慢，带倒影）；计时数字每秒轻轻弹一下；每 3.6 s 扫一次高光 |
+| 识别中 | 波形变成流动的正弦波；右侧黑圆里是锥形渐变彗尾 + 头部光点 + 三颗环绕小点，半径轻微呼吸 |
+| 已上屏 | 对勾沿路径逐段画出（0.3 s）、圆钮弹一下、绿色光圈扩散、六颗小火花、整条玻璃闪一下绿、文字滑入；1.1 s 后淡出 |
+| 出错 | 整颗胶囊左右衰减抖动、感叹号弹跳进入、文字滑入，1.1 s 后淡出 |
+
+时间/状态都由 `time.time()` 驱动，帧率固定 50 fps；胶囊隐藏时直接不渲染（CPU ≈ 0）。
+单帧绘制实测 ~3 ms（含光晕、波形、渐变），只在胶囊出现的两三秒内发生。
+
 ## 使用
 
 | 操作 | 效果 |
@@ -237,7 +252,7 @@ python voice_input.py --config my.toml    # 用别的配置文件
 | 悬浮条变朴素方块 | exe 版正常（打包排除 skia）；脚本版见日志 `[ui] 使用 Skia 渲染` |
 | 玻璃是纯色、没模糊 | 全屏独占程序/安全桌面截不到屏，自动退成纯色 |
 | 粘贴不进去 | 目标窗口是管理员权限 → 以管理员身份运行 `VoiceInput.bat` |
-| exe 版悬浮条不够精致 | 想要 Skia 画质就改用 `python voice_input.py` 直接运行 |
+| exe 版没有动画 | 不该发生：打包版同样带 Skia；看日志里有没有 `[ui] 使用 Skia 渲染` |
 
 日志：`asr.log`（识别服务）、`polish.log`（润色服务）、`client.log`（无控制台时的主程序输出），超过 5 MB 自动轮转。
 
