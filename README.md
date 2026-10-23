@@ -92,7 +92,7 @@ exe 版和脚本版**用同一套 Skia 渲染**，动画完全一致。产物约
 | `requirements.txt` | 6 个 Python 依赖 |
 | `VoiceInput.bat` | 双击启动；`VoiceInput.bat stop` 强制停止 |
 | `build_exe.bat` | 打包成 exe |
-| `README.md` / `LICENSE` | 说明 / MIT |
+| `README.md` / `FLOW.md` / `LICENSE` | 说明 / **完整运行流程与容错设计** / MIT |
 
 运行时目录：`models/`（模型）、`llama/`（llama.cpp）、`dist/`（打包产物）——都已 gitignore，不入库。
 
@@ -210,6 +210,18 @@ python voice_input.py --config my.toml    # 用别的配置文件
 
 **进程模型**：`voice_input.py` 是唯一常驻进程，它把两个 `llama-server` 绑进自己的 Windows Job 对象——主进程不管怎么死（关窗、Ctrl+C、任务管理器强杀），系统都会连带回收子进程。启动时还会检查 8081/8082，先清理上次残留再起自己的。
 
+## 出错时会发生什么
+
+完整流程见 **[FLOW.md](FLOW.md)**（启动 → 录音 → 转写 → 润色 → 上屏 → 待机 → 退出，含每条失败分支）。几个要点：
+
+- **启动失败一定能看见**：配置写错、模型缺失、服务起不来 → 弹窗 + 控制台双通道提示（没有控制台的 pythonw / exe 也一样）
+- **润色模型缺失会自动降级**：只跑识别，启动时给警告，不会因此打不开
+- **服务被杀了会自己回来**：每 20 秒巡检一次，进程死 / 端口无响应就重启；录音或识别进行中则等下一轮
+- **热键名写错回退 CapsLock**；暂停时不再吞 CapsLock，大小写恢复原功能
+- **悬浮条线程挂了会被重建**（最多 3 次）
+- **任何退出方式都不留后台**：托盘退出 / 关窗 / Ctrl+C / 强杀 / 注销，靠 Windows Job 对象兜底
+- **计时和动画用单调时钟**：系统时间被校准也不会跳变
+
 ## 性能实测
 
 环境：Windows 11 + NVIDIA 独显（CUDA 12.4 / llama.cpp b11304）、ASR Q8_0 + 润色 Q4_K_M。
@@ -241,6 +253,11 @@ python voice_input.py --config my.toml    # 用别的配置文件
 | 现象 | 原因 / 处理 |
 |---|---|
 | 双击 bat 闪一下就没了 | 在 cmd 里跑 `python -u voice_input.py` 看报错；或 `python voice_input.py --check` 查缺什么 |
+| 弹窗「config.toml 解析失败」 | 配置里有 TOML 语法错误，按提示的行列改 |
+| 悬浮条提示「说话太短」 | 有效语音 < 0.25 s，按住多说一会 |
+| 悬浮条提示「识别超时」 | 句子太长或服务卡住，看 `asr.log`；可调 `[asr] timeout` |
+| 悬浮条提示「写剪贴板失败」 | 剪贴板被别的程序占用，关掉占用者重试 |
+| 启动日志有 `已自动关闭润色` | 润色模型没找到（只影响润色，识别正常） |
 | `--check` 报缺 llama-server.exe | llama.cpp 没解压或 `[llama] dir` 指错。跑 `python voice_input.py --setup --no-models` |
 | `--check` 报缺模型 | 跑 `python voice_input.py --setup --no-llama`，或手动放 `models\` |
 | `:8081 等了 180 秒没就绪` | 看 `asr.log`：显存不足 / 驱动版本不匹配 / 模型文件损坏 |

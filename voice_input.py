@@ -95,7 +95,13 @@ from pynput import keyboard as kb
 
 # pythonw（开机自启）没有控制台，stdout 是 None，print 会炸 → 写日志文件
 if sys.stdout is None:
-    _early_log = open(ROOT / "client.log", "a", encoding="utf-8", buffering=1)
+    _log_path = ROOT / "client.log"
+    try:                                   # 超过 5MB 轮转，避免无限增长
+        if _log_path.exists() and _log_path.stat().st_size > 5 * 1024 * 1024:
+            _log_path.replace(ROOT / "client.log.1")
+    except Exception:
+        pass
+    _early_log = open(_log_path, "a", encoding="utf-8", buffering=1)
     sys.stdout = _early_log
     sys.stderr = _early_log
 
@@ -115,6 +121,50 @@ def resolve_path(p) -> Path:
     """相对路径按项目根目录解析；绝对路径原样返回。"""
     p = Path(p).expanduser()
     return p if p.is_absolute() else (ROOT / p).resolve()
+
+
+def notify(title: str, msg: str, error: bool = False) -> None:
+    """控制台 + 弹窗双通道提示（pythonw / 打包后没有控制台，只能靠弹窗）。"""
+    try:
+        print(f"[{'fatal' if error else 'info'}] {title}: {msg}")
+        sys.stdout.flush()
+    except Exception:
+        pass
+    if os.environ.get("VOICE_INPUT_NO_GUI"):   # 自动化测试时关掉弹窗
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None, str(msg), str(title), 0x10 if error else 0x40)
+    except Exception:
+        pass
+
+
+VALID_HOTKEYS = ("caps_lock", "scroll_lock", "pause", "f9")
+
+
+def prepare_cfg(cfg: dict, manage_servers: bool = True) -> list[str]:
+    """启动前把配置修成能跑的状态，返回警告列表；致命问题抛 SystemExit。"""
+    warns: list[str] = []
+    hk = str(cfg.setdefault("hotkey", {}).get("key") or "caps_lock").lower()
+    if hk not in VALID_HOTKEYS:
+        cfg["hotkey"]["key"] = "caps_lock"
+        warns.append(f'热键 "{hk}" 不支持，已回退到 caps_lock')
+    if not manage_servers:
+        return warns
+    L = cfg.get("llama", {})
+    asr = resolve_path(L.get("asr_model", ""))
+    mm = resolve_path(L.get("asr_mmproj", ""))
+    missing = [q for q in (asr, mm) if not q.exists()]
+    if missing:
+        raise SystemExit(
+            "缺少识别模型：\n  " + "\n  ".join(str(q) for q in missing)
+            + "\n\n先运行: python voice_input.py --setup")
+    pol = resolve_path(L.get("polish_model", ""))
+    if cfg.get("polish", {}).get("enabled", True) and not pol.exists():
+        cfg["polish"]["enabled"] = False
+        warns.append(f"没有润色模型 {pol.name}，已自动关闭润色（只用识别原文）")
+    return warns
 
 
 # ---------------------------------------------------------------- 录音
@@ -173,6 +223,8 @@ class Recorder:
             try:
                 self._stream.stop()
                 self._stream.close()
+            except Exception as e:       # 设备被拔掉 / 驱动异常
+                print(f"[warn] 关闭音频流失败: {e}")
             finally:
                 self._stream = None
         if not self._chunks:
@@ -325,7 +377,8 @@ def polish(text: str, cfg: dict) -> str:
 # ---------------------------------------------------------------- 上屏
 
 
-def paste_text(text: str, cfg: dict):
+def paste_text(text: str, cfg: dict) -> bool:
+    """写剪贴板 + 模拟 Ctrl+V；返回 False 表示连剪贴板都写不进去。"""
     out = cfg["output"]
     old = None
     if out.get("restore_clipboard", True):
@@ -334,9 +387,13 @@ def paste_text(text: str, cfg: dict):
         except Exception:
             old = None
 
-    pyperclip.copy(text)
+    try:
+        pyperclip.copy(text)
+    except Exception as e:
+        print(f"[error] 写剪贴板失败: {e}")
+        return False
     if not out.get("paste", True):
-        return
+        return True
     time.sleep(0.06)
     ctl = kb.Controller()
     with ctl.pressed(kb.Key.ctrl):
@@ -352,6 +409,7 @@ def paste_text(text: str, cfg: dict):
                 pass
 
         threading.Thread(target=_restore, daemon=True).start()
+    return True
 
 
 # ---------------------------------------------------------------- 主逻辑
@@ -375,6 +433,7 @@ class App:
         self.servers = None
         self._quit = threading.Event()
         self._restart_lock = threading.Lock()
+        self._overlay_tries = 0
 
     # ---- 状态
     def _show(self, state: str, text: str = ""):
@@ -390,18 +449,40 @@ class App:
         print("⏸ 已暂停" if value else "▶ 已恢复")
 
     def _watchdog(self):
-        """每 20 秒巡检一次推理服务；睡眠唤醒后模型进程可能已被系统回收。"""
+        """每 20 秒巡检：模型服务是否还活着、悬浮条线程有没有挂。"""
         while not self._quit.wait(20):
+            if not self._overlay_alive():
+                self._restart_overlay()
             if self.busy or self.recording or self.servers is None:
                 continue
             if not self._restart_lock.acquire(blocking=False):
                 continue
             try:
                 self.servers.ensure_running()
-            except Exception as e:
-                print(f"[看门狗] 重启失败: {e}")
+            except BaseException as e:   # SystemExit 也要吃掉，否则巡检线程直接死掉
+                print(f"[看门狗] 重启失败: {type(e).__name__}: {e}")
             finally:
                 self._restart_lock.release()
+
+    def _overlay_alive(self) -> bool:
+        t = getattr(self.overlay, "_thread", None)
+        return t is None or t.is_alive()
+
+    def _restart_overlay(self):
+        if self._overlay_tries >= 3:
+            return
+        self._overlay_tries += 1
+        print("[看门狗] 悬浮条线程已退出，正在重建…")
+        try:
+            self.overlay.stop()
+        except Exception:
+            pass
+        try:
+            self.overlay, self.native_overlay = create_overlay(self.meter, self.cfg)
+            self._show("idle")
+            print("[看门狗] 悬浮条已恢复")
+        except Exception as e:
+            print(f"[看门狗] 悬浮条重建失败: {type(e).__name__}: {e}")
 
     def quit(self):
         self._quit.set()
@@ -439,19 +520,29 @@ class App:
             dur = len(audio) / self.sr
             if dur < 0.25:
                 print("(太短，忽略)")
-                self._show("idle")
+                self._show("error", "说话太短，再说一次")
                 return
 
             self._show("busy")
-            t0 = time.time()
+            t0 = time.perf_counter()
             try:
                 raw = transcribe(to_wav(audio, self.sr), self.cfg)
+            except urllib.error.HTTPError as e:
+                msg = f"识别服务报错 HTTP {e.code}（看 asr.log）"
+                print(f"[error] {msg}")
+                self._show("error", msg)
+                return
+            except (TimeoutError, socket.timeout):
+                msg = "识别超时（句子太长或服务卡住）"
+                print(f"[error] {msg}")
+                self._show("error", msg)
+                return
             except urllib.error.URLError as e:
                 msg = "识别服务没连上（先运行 VoiceInput.bat）"
                 print(f"[error] {msg}: {e.reason}")
                 self._show("error", msg)
                 return
-            t1 = time.time()
+            t1 = time.perf_counter()
             print(f"[asr {dur:.2f}s audio / {t1 - t0:.2f}s] {raw}")
 
             if not raw.strip():
@@ -461,12 +552,14 @@ class App:
             final = raw
             try:
                 final = polish(raw, self.cfg)
-                print(f"[polish {time.time() - t1:.2f}s] {final}")
+                print(f"[polish {time.perf_counter() - t1:.2f}s] {final}")
             except Exception as e:
                 print(f"[warn] 润色失败，用原文: {e}")
 
-            paste_text(final, self.cfg)
-            self._show("done")
+            if paste_text(final, self.cfg):
+                self._show("done")
+            else:
+                self._show("error", "写剪贴板失败")
             if self.rec.overflow:
                 print("[warn] 本次录音超过上限，末尾部分未包含")
         except Exception as e:
@@ -487,6 +580,8 @@ class App:
                 app = self
 
                 def win32_filter(msg, data):
+                    if app.paused:      # 暂停时别吞按键，CapsLock 恢复原功能
+                        return True
                     if data.vkCode == vk and msg in (0x100, 0x104):
                         app.on_down()
                         return False  # 吞掉，CapsLock 不会切换大小写
@@ -513,7 +608,12 @@ class App:
         print(f"就绪。按住 [{self.cfg['hotkey']['key']}] 说话，松开上屏。")
         print("托盘图标右键可暂停 / 开机自启 / 退出。")
         self.start_hotkey()
-        self.tray.start()
+        if not self.tray.start():
+            hint = ("托盘图标不可用（没装 pystray）。\n\n"
+                    "退出方式：关闭这个窗口 / Ctrl+C，或运行 VoiceInput.bat stop")
+            print("[warn] " + hint)
+            if sys.stdout is None:     # pythonw / 打包后没有控制台，只能弹窗告诉用户
+                notify("Voice Input", hint)
         self._show("idle")
 
         if self.servers is not None:
@@ -625,6 +725,7 @@ class ServerManager:
         self.procs: list = []
         self._logs = []
         self.job = JobGuard()
+        self._lock = threading.RLock()
 
     @staticmethod
     def healthy(port: int, timeout: float = 1.5) -> bool:
@@ -674,8 +775,6 @@ class ServerManager:
             if not f.exists():
                 raise SystemExit(f"缺少模型文件：{f}")
         polish_model = resolve_path(L["polish_model"])
-        if not polish_model.exists():
-            raise SystemExit(f"缺少润色模型：{polish_model}")
 
         common = [
             "--host", "127.0.0.1", "-ngl", ngl, "-c", "4096",
@@ -690,14 +789,17 @@ class ServerManager:
             )
         ]
         if self.cfg.get("polish", {}).get("enabled", True):
-            jobs.append(
-                (
-                    8082,
-                    [exe, "-m", str(polish_model), "--port", "8082",
-                     "--temp", "0.2"] + common,
-                    "polish.log",
+            if polish_model.exists():
+                jobs.append(
+                    (
+                        8082,
+                        [exe, "-m", str(polish_model), "--port", "8082",
+                         "--temp", "0.2"] + common,
+                        "polish.log",
+                    )
                 )
-            )
+            else:
+                print(f"[warn] 润色模型不存在，只启动识别服务：{polish_model}")
         return jobs
 
     @staticmethod
@@ -734,6 +836,10 @@ class ServerManager:
             time.sleep(1.5)
 
     def start(self):
+        with self._lock:
+            return self._start()
+
+    def _start(self):
         jobs = self.plan()
         ports = [p for p, _, _ in jobs]
         if any(self.healthy(p) for p in ports):
@@ -761,6 +867,10 @@ class ServerManager:
                 time.sleep(0.5)
 
     def ensure_running(self) -> bool:
+        with self._lock:
+            return self._ensure_running()
+
+    def _ensure_running(self) -> bool:
         """健康检查：进程死了或端口无响应 → 重启。返回是否做了重启。"""
         if not self.procs:
             return False
@@ -780,6 +890,10 @@ class ServerManager:
         return True
 
     def stop(self):
+        with self._lock:
+            return self._stop()
+
+    def _stop(self):
         if not self.procs:
             return
         for p in self.procs:
@@ -857,22 +971,58 @@ def acquire_single_instance(port: int = 49731):
         return None
 
 
-def main():
-    cfg = load_cfg()
+def main() -> int:
+    # ---- 1. 读配置（缺文件 / 语法错都要能看见）
+    try:
+        cfg = load_cfg()
+    except FileNotFoundError:
+        notify("Voice Input 启动失败",
+               f"找不到配置文件：\n{CFG_PATH}\n\n请把 config.toml 放回程序目录。", True)
+        return 1
+    except Exception as e:
+        notify("Voice Input 启动失败", f"config.toml 解析失败：\n{e}", True)
+        return 1
+
+    # ---- 2. 配置自检（热键回退 / 润色模型缺失降级 / 识别模型缺失致命）
+    manage = bool(cfg.get("llama", {}).get("manage", True))
+    try:
+        for w in prepare_cfg(cfg, manage):
+            print(f"[warn] {w}")
+    except SystemExit as e:
+        notify("Voice Input 启动失败", str(e), True)
+        return 1
+
+    # ---- 3. 单实例
     lock = acquire_single_instance()
     if lock is None:
         print("已经有一个语音输入在运行了，这个窗口会在 2 秒后自动关闭。")
         print("（要彻底退出：托盘右键 → 退出，或运行 VoiceInput.bat stop）")
         time.sleep(2.0)
-        return
+        return 0
 
+    # ---- 4. 起模型服务
     servers = None
-    if cfg.get("llama", {}).get("manage", True):
+    if manage:
         servers = ServerManager(cfg)
-        servers.start()
+        try:
+            servers.start()
+        except SystemExit as e:
+            notify("模型服务启动失败", str(e), True)
+            return 1
+        except Exception as e:
+            notify("模型服务启动失败", f"{type(e).__name__}: {e}", True)
+            return 1
         install_exit_hooks(servers.stop)
 
-    app = App(cfg)
+    # ---- 5. 起界面
+    try:
+        app = App(cfg)
+    except Exception as e:
+        notify("界面初始化失败", f"{type(e).__name__}: {e}", True)
+        if servers is not None:
+            servers.stop()
+        return 1
+
     app.servers = servers
     try:
         app.run()
@@ -882,7 +1032,10 @@ def main():
             servers.stop()
             print("已清理干净。")
         # 托盘/音频线程可能残留，强制退出；Job 句柄随进程关闭，子进程一定被回收
-        sys.stdout.flush()
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
         os._exit(0)
 
 
@@ -2089,7 +2242,6 @@ class SkiaOverlay:
         self._gfx_dirty = False
         self._img_cache = {}
         self._bar_shader = None
-        self._bar_shader = None
 
     def _recreate_window(self):
         """窗口句柄都没了（会话切换/桌面重建）时整个重来。"""
@@ -2129,7 +2281,7 @@ class SkiaOverlay:
 
     # -------------------------------------------------- 动画
     def _tick(self):
-        now = time.time()
+        now = time.monotonic()      # 系统改时间也不会让动画/计时跳变
         self._tick_n += 1
 
         # 图形资源失效（睡眠唤醒/换分辨率）→ 重建
@@ -2147,12 +2299,12 @@ class SkiaOverlay:
         try:
             while True:
                 state, text = self._q.get_nowait()
-                prev = self._state
                 self._accent_prev = self._accent_now
                 self._state = state
                 self._text = text
                 self._state_t = now
-                if prev == "idle" or state == "recording":
+                # 只有完全隐藏时才播“出现动画”，避免胶囊还亮着时再弹一次
+                if self._alpha <= 0.02:
                     self._shown_t = now
                     self._last_t = now
                     self._appear = 0.0
@@ -3232,10 +3384,7 @@ def check_env() -> int:
     exe = resolve_path(L.get("dir", "llama")) / "llama-server.exe"
     if not exe.exists():
         missing.append(f"llama-server.exe  ->  {exe}")
-    keys = ["asr_model", "asr_mmproj"]
-    if cfg.get("polish", {}).get("enabled", True):
-        keys.append("polish_model")
-    for k in keys:
+    for k in ("asr_model", "asr_mmproj"):
         p = resolve_path(L.get(k, ""))
         if not p.exists():
             missing.append(f"{k:<12}  ->  {p}")
@@ -3245,7 +3394,11 @@ def check_env() -> int:
             print("    - " + m)
         print("\n    一键下载: python voice_input.py --setup")
         return 1
-    print("[OK] 环境就绪：llama.cpp + 模型都在。")
+    pol = resolve_path(L.get("polish_model", ""))
+    if cfg.get("polish", {}).get("enabled", True) and not pol.exists():
+        print("[!] 没有润色模型，启动时会自动关闭润色：")
+        print("    - " + str(pol))
+    print("[OK] 环境就绪：llama.cpp + 识别模型都在。")
     return 0
 
 
@@ -3345,4 +3498,4 @@ if __name__ == "__main__":
         sys.exit(setup_all(_args))
     if _args.test:
         sys.exit(test_wav(_args.test, not _args.no_polish))
-    main()
+    sys.exit(main())
